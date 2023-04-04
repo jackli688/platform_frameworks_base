@@ -20,10 +20,12 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.app.ActivityOptions
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.os.Bundle
 import android.text.TextUtils
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -32,32 +34,35 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Toast
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
+import androidx.activity.ComponentActivity
 import androidx.viewpager2.widget.ViewPager2
 import com.android.systemui.Prefs
 import com.android.systemui.R
-import com.android.systemui.broadcast.BroadcastDispatcher
 import com.android.systemui.controls.ControlsServiceInfo
 import com.android.systemui.controls.TooltipManager
 import com.android.systemui.controls.controller.ControlsControllerImpl
 import com.android.systemui.controls.controller.StructureInfo
+import com.android.systemui.controls.ui.ControlsActivity
+import com.android.systemui.controls.ui.ControlsUiController
 import com.android.systemui.dagger.qualifiers.Main
-import com.android.systemui.globalactions.GlobalActionsComponent
-import com.android.systemui.settings.CurrentUserTracker
-import com.android.systemui.util.LifecycleActivity
+import com.android.systemui.settings.UserTracker
 import java.text.Collator
 import java.util.concurrent.Executor
 import java.util.function.Consumer
 import javax.inject.Inject
 
-class ControlsFavoritingActivity @Inject constructor(
+open class ControlsFavoritingActivity @Inject constructor(
     @Main private val executor: Executor,
     private val controller: ControlsControllerImpl,
     private val listingController: ControlsListingController,
-    broadcastDispatcher: BroadcastDispatcher,
-    private val globalActionsComponent: GlobalActionsComponent
-) : LifecycleActivity() {
+    private val userTracker: UserTracker,
+    private val uiController: ControlsUiController
+) : ComponentActivity() {
 
     companion object {
+        private const val DEBUG = false
         private const val TAG = "ControlsFavoritingActivity"
 
         // If provided and no structure is available, use as the title
@@ -66,7 +71,7 @@ class ControlsFavoritingActivity @Inject constructor(
         // If provided, show this structure page first
         const val EXTRA_STRUCTURE = "extra_structure"
         const val EXTRA_SINGLE_STRUCTURE = "extra_single_structure"
-        internal const val EXTRA_FROM_PROVIDER_SELECTOR = "extra_from_provider_selector"
+        const val EXTRA_FROM_PROVIDER_SELECTOR = "extra_from_provider_selector"
         private const val TOOLTIP_PREFS_KEY = Prefs.Key.CONTROLS_STRUCTURE_SWIPE_TOOLTIP_COUNT
         private const val TOOLTIP_MAX_SHOWN = 2
     }
@@ -90,15 +95,22 @@ class ControlsFavoritingActivity @Inject constructor(
     private var cancelLoadRunnable: Runnable? = null
     private var isPagerLoaded = false
 
-    private val currentUserTracker = object : CurrentUserTracker(broadcastDispatcher) {
+    private val userTrackerCallback: UserTracker.Callback = object : UserTracker.Callback {
         private val startingUser = controller.currentUserId
 
-        override fun onUserSwitched(newUserId: Int) {
-            if (newUserId != startingUser) {
-                stopTracking()
+        override fun onUserChanged(newUser: Int, userContext: Context) {
+            if (newUser != startingUser) {
+                userTracker.removeCallback(this)
                 finish()
             }
         }
+    }
+
+    private val mOnBackInvokedCallback = OnBackInvokedCallback {
+        if (DEBUG) {
+            Log.d(TAG, "Predictive Back dispatcher called mOnBackInvokedCallback")
+        }
+        onBackPressed()
     }
 
     private val listingCallback = object : ControlsListingController.ControlsListingCallback {
@@ -114,7 +126,7 @@ class ControlsFavoritingActivity @Inject constructor(
 
     override fun onBackPressed() {
         if (!fromProviderSelector) {
-            globalActionsComponent.handleShowGlobalActionsMenu()
+            openControlsOrigin()
         }
         animateExitAndFinish()
     }
@@ -302,9 +314,6 @@ class ControlsFavoritingActivity @Inject constructor(
     private fun bindButtons() {
         otherAppsButton = requireViewById<Button>(R.id.other_apps).apply {
             setOnClickListener {
-                val i = Intent().apply {
-                    component = ComponentName(context, ControlsProviderSelectorActivity::class.java)
-                }
                 if (doneButton.isEnabled) {
                     // The user has made changes
                     Toast.makeText(
@@ -313,8 +322,11 @@ class ControlsFavoritingActivity @Inject constructor(
                             Toast.LENGTH_SHORT
                             ).show()
                 }
-                startActivity(i, ActivityOptions
-                    .makeSceneTransitionAnimation(this@ControlsFavoritingActivity).toBundle())
+                startActivity(
+                    Intent(context, ControlsProviderSelectorActivity::class.java),
+                    ActivityOptions
+                        .makeSceneTransitionAnimation(this@ControlsFavoritingActivity).toBundle()
+                )
                 animateExitAndFinish()
             }
         }
@@ -330,21 +342,34 @@ class ControlsFavoritingActivity @Inject constructor(
                     )
                 }
                 animateExitAndFinish()
-                globalActionsComponent.handleShowGlobalActionsMenu()
+                openControlsOrigin()
             }
         }
+    }
+
+    private fun openControlsOrigin() {
+        startActivity(
+            Intent(applicationContext, ControlsActivity::class.java),
+            ActivityOptions.makeSceneTransitionAnimation(this).toBundle()
+        )
     }
 
     override fun onPause() {
         super.onPause()
         mTooltipManager?.hide(false)
-    }
+   }
 
     override fun onStart() {
         super.onStart()
 
         listingController.addCallback(listingCallback)
-        currentUserTracker.startTracking()
+        userTracker.addCallback(userTrackerCallback, executor)
+
+        if (DEBUG) {
+            Log.d(TAG, "Registered onBackInvokedCallback")
+        }
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT, mOnBackInvokedCallback)
     }
 
     override fun onResume() {
@@ -357,13 +382,19 @@ class ControlsFavoritingActivity @Inject constructor(
             loadControls()
             isPagerLoaded = true
         }
-    }
+   }
 
     override fun onStop() {
         super.onStop()
 
         listingController.removeCallback(listingCallback)
-        currentUserTracker.stopTracking()
+        userTracker.removeCallback(userTrackerCallback)
+
+        if (DEBUG) {
+            Log.d(TAG, "Unregistered onBackInvokedCallback")
+        }
+        onBackInvokedDispatcher.unregisterOnBackInvokedCallback(
+                mOnBackInvokedCallback)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

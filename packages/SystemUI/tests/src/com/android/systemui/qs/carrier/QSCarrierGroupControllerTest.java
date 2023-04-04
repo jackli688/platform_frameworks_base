@@ -16,16 +16,26 @@
 
 package com.android.systemui.qs.carrier;
 
+import static com.google.common.truth.Truth.assertThat;
+
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyZeroInteractions;
 import static org.mockito.Mockito.when;
 
+import android.content.Context;
+import android.content.Intent;
 import android.os.Handler;
-import android.telephony.SubscriptionManager;
+import android.provider.Settings;
 import android.testing.AndroidTestingRunner;
 import android.testing.TestableLooper;
 import android.view.View;
@@ -33,19 +43,22 @@ import android.widget.TextView;
 
 import androidx.test.filters.SmallTest;
 
-import com.android.keyguard.CarrierTextController;
+import com.android.keyguard.CarrierTextManager;
 import com.android.systemui.plugins.ActivityStarter;
-import com.android.systemui.statusbar.policy.NetworkController;
+import com.android.systemui.statusbar.connectivity.IconState;
+import com.android.systemui.statusbar.connectivity.MobileDataIndicators;
+import com.android.systemui.statusbar.connectivity.NetworkController;
+import com.android.systemui.statusbar.connectivity.SignalCallback;
+import com.android.systemui.util.CarrierConfigTracker;
 import com.android.systemui.utils.leaks.LeakCheckedTest;
 import com.android.systemui.utils.os.FakeHandler;
 
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
-import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
-import org.mockito.stubbing.Answer;
 
 @RunWith(AndroidTestingRunner.class)
 @TestableLooper.RunWithLooper
@@ -53,8 +66,8 @@ import org.mockito.stubbing.Answer;
 public class QSCarrierGroupControllerTest extends LeakCheckedTest {
 
     private QSCarrierGroupController mQSCarrierGroupController;
-    private NetworkController.SignalCallback mSignalCallback;
-    private CarrierTextController.CarrierTextCallback mCallback;
+    private SignalCallback mSignalCallback;
+    private CarrierTextManager.CarrierTextCallback mCallback;
     @Mock
     private QSCarrierGroup mQSCarrierGroup;
     @Mock
@@ -62,10 +75,23 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
     @Mock
     private NetworkController mNetworkController;
     @Mock
-    private CarrierTextController.Builder mCarrierTextControllerBuilder;
+    private CarrierTextManager.Builder mCarrierTextControllerBuilder;
     @Mock
-    private CarrierTextController mCarrierTextController;
+    private CarrierTextManager mCarrierTextManager;
+    @Mock
+    private CarrierConfigTracker mCarrierConfigTracker;
+    @Mock
+    private QSCarrier mQSCarrier1;
+    @Mock
+    private QSCarrier mQSCarrier2;
+    @Mock
+    private QSCarrier mQSCarrier3;
     private TestableLooper mTestableLooper;
+    @Mock
+    private QSCarrierGroupController.OnSingleCarrierChangedListener mOnSingleCarrierChangedListener;
+
+    private FakeSlotIndexResolver mSlotIndexResolver;
+    private ClickListenerTextView mNoCarrierTextView;
 
     @Before
     public void setup() throws Exception {
@@ -77,44 +103,48 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         when(mNetworkController.hasVoiceCallingFeature()).thenReturn(true);
         doAnswer(invocation -> mSignalCallback = invocation.getArgument(0))
                 .when(mNetworkController)
-                .addCallback(any(NetworkController.SignalCallback.class));
+                .addCallback(any(SignalCallback.class));
 
         when(mCarrierTextControllerBuilder.setShowAirplaneMode(anyBoolean()))
                 .thenReturn(mCarrierTextControllerBuilder);
         when(mCarrierTextControllerBuilder.setShowMissingSim(anyBoolean()))
                 .thenReturn(mCarrierTextControllerBuilder);
-        when(mCarrierTextControllerBuilder.build()).thenReturn(mCarrierTextController);
+        when(mCarrierTextControllerBuilder.build()).thenReturn(mCarrierTextManager);
 
         doAnswer(invocation -> mCallback = invocation.getArgument(0))
-                .when(mCarrierTextController)
-                .setListening(any(CarrierTextController.CarrierTextCallback.class));
+                .when(mCarrierTextManager)
+                .setListening(any(CarrierTextManager.CarrierTextCallback.class));
 
-        when(mQSCarrierGroup.getNoSimTextView()).thenReturn(new TextView(mContext));
-        when(mQSCarrierGroup.getCarrier1View()).thenReturn(mock(QSCarrier.class));
-        when(mQSCarrierGroup.getCarrier2View()).thenReturn(mock(QSCarrier.class));
-        when(mQSCarrierGroup.getCarrier3View()).thenReturn(mock(QSCarrier.class));
+        mNoCarrierTextView = new ClickListenerTextView(mContext);
+        when(mQSCarrierGroup.getNoSimTextView()).thenReturn(mNoCarrierTextView);
+        when(mQSCarrierGroup.getCarrier1View()).thenReturn(mQSCarrier1);
+        when(mQSCarrierGroup.getCarrier2View()).thenReturn(mQSCarrier2);
+        when(mQSCarrierGroup.getCarrier3View()).thenReturn(mQSCarrier3);
         when(mQSCarrierGroup.getCarrierDivider1()).thenReturn(new View(mContext));
         when(mQSCarrierGroup.getCarrierDivider2()).thenReturn(new View(mContext));
 
+        mSlotIndexResolver = new FakeSlotIndexResolver();
+
         mQSCarrierGroupController = new QSCarrierGroupController.Builder(
                 mActivityStarter, handler, TestableLooper.get(this).getLooper(),
-                mNetworkController, mCarrierTextControllerBuilder)
+                mNetworkController, mCarrierTextControllerBuilder, mContext, mCarrierConfigTracker,
+                mSlotIndexResolver)
                 .setQSCarrierGroup(mQSCarrierGroup)
                 .build();
 
         mQSCarrierGroupController.setListening(true);
     }
 
+    @Test
+    public void testInitiallyMultiCarrier() {
+        assertFalse(mQSCarrierGroupController.isSingleCarrier());
+    }
+
     @Test // throws no Exception
     public void testUpdateCarrierText_sameLengths() {
-        QSCarrierGroupController spiedCarrierGroupController =
-                Mockito.spy(mQSCarrierGroupController);
-        when(spiedCarrierGroupController.getSlotIndex(anyInt())).thenAnswer(
-                (Answer<Integer>) invocationOnMock -> invocationOnMock.getArgument(0));
-
         // listOfCarriers length 1, subscriptionIds length 1, anySims false
-        CarrierTextController.CarrierTextCallbackInfo
-                c1 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c1 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{""},
                 false,
@@ -122,8 +152,8 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(c1);
 
         // listOfCarriers length 1, subscriptionIds length 1, anySims true
-        CarrierTextController.CarrierTextCallbackInfo
-                c2 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c2 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{""},
                 true,
@@ -131,8 +161,8 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(c2);
 
         // listOfCarriers length 2, subscriptionIds length 2, anySims false
-        CarrierTextController.CarrierTextCallbackInfo
-                c3 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c3 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{"", ""},
                 false,
@@ -140,8 +170,8 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(c3);
 
         // listOfCarriers length 2, subscriptionIds length 2, anySims true
-        CarrierTextController.CarrierTextCallbackInfo
-                c4 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c4 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{"", ""},
                 true,
@@ -153,14 +183,9 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
 
     @Test // throws no Exception
     public void testUpdateCarrierText_differentLength() {
-        QSCarrierGroupController spiedCarrierGroupController =
-                Mockito.spy(mQSCarrierGroupController);
-        when(spiedCarrierGroupController.getSlotIndex(anyInt())).thenAnswer(
-                (Answer<Integer>) invocationOnMock -> invocationOnMock.getArgument(0));
-
         // listOfCarriers length 2, subscriptionIds length 1, anySims false
-        CarrierTextController.CarrierTextCallbackInfo
-                c1 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c1 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{"", ""},
                 false,
@@ -168,8 +193,8 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(c1);
 
         // listOfCarriers length 2, subscriptionIds length 1, anySims true
-        CarrierTextController.CarrierTextCallbackInfo
-                c2 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c2 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{"", ""},
                 true,
@@ -177,8 +202,8 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(c2);
 
         // listOfCarriers length 1, subscriptionIds length 2, anySims false
-        CarrierTextController.CarrierTextCallbackInfo
-                c3 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c3 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{""},
                 false,
@@ -186,8 +211,8 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(c3);
 
         // listOfCarriers length 1, subscriptionIds length 2, anySims true
-        CarrierTextController.CarrierTextCallbackInfo
-                c4 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c4 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{""},
                 true,
@@ -198,13 +223,10 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
 
     @Test // throws no Exception
     public void testUpdateCarrierText_invalidSim() {
-        QSCarrierGroupController spiedCarrierGroupController =
-                Mockito.spy(mQSCarrierGroupController);
-        when(spiedCarrierGroupController.getSlotIndex(anyInt())).thenReturn(
-                SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+        mSlotIndexResolver.overrideInvalid = true;
 
-        CarrierTextController.CarrierTextCallbackInfo
-                c4 = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                c4 = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{"", ""},
                 true,
@@ -215,16 +237,19 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
 
     @Test // throws no Exception
     public void testSetMobileDataIndicators_invalidSim() {
-        mSignalCallback.setMobileDataIndicators(
-                mock(NetworkController.IconState.class),
-                mock(NetworkController.IconState.class),
-                0, 0, true, true, "", "", "", true, 0, true);
+        mSlotIndexResolver.overrideInvalid = true;
+
+        MobileDataIndicators indicators = new MobileDataIndicators(
+                mock(IconState.class),
+                mock(IconState.class),
+                0, 0, true, true, "", "", "", 0, true, true);
+        mSignalCallback.setMobileDataIndicators(indicators);
     }
 
     @Test
     public void testNoEmptyVisibleView_airplaneMode() {
-        CarrierTextController.CarrierTextCallbackInfo
-                info = new CarrierTextController.CarrierTextCallbackInfo(
+        CarrierTextManager.CarrierTextCallbackInfo
+                info = new CarrierTextManager.CarrierTextCallbackInfo(
                 "",
                 new CharSequence[]{""},
                 true,
@@ -233,5 +258,197 @@ public class QSCarrierGroupControllerTest extends LeakCheckedTest {
         mCallback.updateCarrierInfo(info);
         mTestableLooper.processAllMessages();
         assertEquals(View.GONE, mQSCarrierGroup.getNoSimTextView().getVisibility());
+    }
+
+    @Test
+    public void testListenerNotCalledOnRegistreation() {
+        mQSCarrierGroupController
+                .setOnSingleCarrierChangedListener(mOnSingleCarrierChangedListener);
+
+        verify(mOnSingleCarrierChangedListener, never()).onSingleCarrierChanged(anyBoolean());
+    }
+
+    @Test
+    public void testSingleCarrier() {
+        // Only one element in the info
+        CarrierTextManager.CarrierTextCallbackInfo
+                info = new CarrierTextManager.CarrierTextCallbackInfo(
+                "",
+                new CharSequence[]{""},
+                true,
+                new int[]{0},
+                false /* airplaneMode */);
+
+        mCallback.updateCarrierInfo(info);
+        mTestableLooper.processAllMessages();
+
+        verify(mQSCarrier1).updateState(any(), eq(true));
+        verify(mQSCarrier2).updateState(any(), eq(true));
+        verify(mQSCarrier3).updateState(any(), eq(true));
+    }
+
+    @Test
+    public void testMultiCarrier() {
+        // More than one element in the info
+        CarrierTextManager.CarrierTextCallbackInfo
+                info = new CarrierTextManager.CarrierTextCallbackInfo(
+                "",
+                new CharSequence[]{"", ""},
+                true,
+                new int[]{0, 1},
+                false /* airplaneMode */);
+
+        mCallback.updateCarrierInfo(info);
+        mTestableLooper.processAllMessages();
+
+        verify(mQSCarrier1).updateState(any(), eq(false));
+        verify(mQSCarrier2).updateState(any(), eq(false));
+        verify(mQSCarrier3).updateState(any(), eq(false));
+    }
+
+    @Test
+    public void testSingleMultiCarrierSwitch() {
+        CarrierTextManager.CarrierTextCallbackInfo
+                singleCarrierInfo = new CarrierTextManager.CarrierTextCallbackInfo(
+                "",
+                new CharSequence[]{""},
+                true,
+                new int[]{0},
+                false /* airplaneMode */);
+
+        CarrierTextManager.CarrierTextCallbackInfo
+                multiCarrierInfo = new CarrierTextManager.CarrierTextCallbackInfo(
+                "",
+                new CharSequence[]{"", ""},
+                true,
+                new int[]{0, 1},
+                false /* airplaneMode */);
+
+        mCallback.updateCarrierInfo(singleCarrierInfo);
+        mTestableLooper.processAllMessages();
+
+        mQSCarrierGroupController
+                .setOnSingleCarrierChangedListener(mOnSingleCarrierChangedListener);
+        reset(mOnSingleCarrierChangedListener);
+
+        mCallback.updateCarrierInfo(multiCarrierInfo);
+        mTestableLooper.processAllMessages();
+        verify(mOnSingleCarrierChangedListener).onSingleCarrierChanged(false);
+
+        mCallback.updateCarrierInfo(singleCarrierInfo);
+        mTestableLooper.processAllMessages();
+        verify(mOnSingleCarrierChangedListener).onSingleCarrierChanged(true);
+    }
+
+    @Test
+    public void testNoCallbackIfSingleCarrierDoesntChange() {
+        CarrierTextManager.CarrierTextCallbackInfo
+                singleCarrierInfo = new CarrierTextManager.CarrierTextCallbackInfo(
+                "",
+                new CharSequence[]{""},
+                true,
+                new int[]{0},
+                false /* airplaneMode */);
+
+        mCallback.updateCarrierInfo(singleCarrierInfo);
+        mTestableLooper.processAllMessages();
+
+        mQSCarrierGroupController
+                .setOnSingleCarrierChangedListener(mOnSingleCarrierChangedListener);
+
+        mCallback.updateCarrierInfo(singleCarrierInfo);
+        mTestableLooper.processAllMessages();
+
+        verify(mOnSingleCarrierChangedListener, never()).onSingleCarrierChanged(anyBoolean());
+    }
+
+    @Test
+    public void testNoCallbackIfMultiCarrierDoesntChange() {
+        CarrierTextManager.CarrierTextCallbackInfo
+                multiCarrierInfo = new CarrierTextManager.CarrierTextCallbackInfo(
+                "",
+                new CharSequence[]{"", ""},
+                true,
+                new int[]{0, 1},
+                false /* airplaneMode */);
+
+        mCallback.updateCarrierInfo(multiCarrierInfo);
+        mTestableLooper.processAllMessages();
+
+        mQSCarrierGroupController
+                .setOnSingleCarrierChangedListener(mOnSingleCarrierChangedListener);
+
+        mCallback.updateCarrierInfo(multiCarrierInfo);
+        mTestableLooper.processAllMessages();
+
+        verify(mOnSingleCarrierChangedListener, never()).onSingleCarrierChanged(anyBoolean());
+    }
+
+    @Test
+    public void testOnlyInternalViewsHaveClickableListener() {
+        ArgumentCaptor<View.OnClickListener> captor =
+                ArgumentCaptor.forClass(View.OnClickListener.class);
+
+        verify(mQSCarrier1).setOnClickListener(captor.capture());
+        verify(mQSCarrier2).setOnClickListener(captor.getValue());
+        verify(mQSCarrier3).setOnClickListener(captor.getValue());
+
+        assertThat(mNoCarrierTextView.getOnClickListener()).isSameInstanceAs(captor.getValue());
+        verify(mQSCarrierGroup, never()).setOnClickListener(any());
+    }
+
+    @Test
+    public void testOnClickListenerDoesntStartActivityIfViewNotVisible() {
+        ArgumentCaptor<View.OnClickListener> captor =
+                ArgumentCaptor.forClass(View.OnClickListener.class);
+
+        verify(mQSCarrier1).setOnClickListener(captor.capture());
+        when(mQSCarrier1.isVisibleToUser()).thenReturn(false);
+
+        captor.getValue().onClick(mQSCarrier1);
+        verifyZeroInteractions(mActivityStarter);
+    }
+
+    @Test
+    public void testOnClickListenerLaunchesActivityIfViewVisible() {
+        ArgumentCaptor<View.OnClickListener> listenerCaptor =
+                ArgumentCaptor.forClass(View.OnClickListener.class);
+        ArgumentCaptor<Intent> intentCaptor = ArgumentCaptor.forClass(Intent.class);
+
+        verify(mQSCarrier1).setOnClickListener(listenerCaptor.capture());
+        when(mQSCarrier1.isVisibleToUser()).thenReturn(true);
+
+        listenerCaptor.getValue().onClick(mQSCarrier1);
+        verify(mActivityStarter)
+                .postStartActivityDismissingKeyguard(intentCaptor.capture(), anyInt());
+        assertThat(intentCaptor.getValue().getAction())
+                .isEqualTo(Settings.ACTION_WIRELESS_SETTINGS);
+    }
+
+    private class FakeSlotIndexResolver implements QSCarrierGroupController.SlotIndexResolver {
+        public boolean overrideInvalid;
+
+        @Override
+        public int getSlotIndex(int subscriptionId) {
+            return overrideInvalid ? -1 : subscriptionId;
+        }
+    }
+
+    private class ClickListenerTextView extends TextView {
+        View.OnClickListener mListener = null;
+
+        ClickListenerTextView(Context context) {
+            super(context);
+        }
+
+        @Override
+        public void setOnClickListener(OnClickListener l) {
+            super.setOnClickListener(l);
+            mListener = l;
+        }
+
+        View.OnClickListener getOnClickListener() {
+            return mListener;
+        }
     }
 }

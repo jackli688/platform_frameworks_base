@@ -16,7 +16,7 @@
 
 package com.android.systemui.statusbar.notification.stack;
 
-import static com.android.systemui.statusbar.notification.stack.NotificationSectionsManagerKt.BUCKET_MEDIA_CONTROLS;
+import static com.android.systemui.statusbar.notification.stack.NotificationPriorityBucketKt.BUCKET_MEDIA_CONTROLS;
 
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
@@ -26,7 +26,7 @@ import android.graphics.Rect;
 import android.view.View;
 import android.view.animation.Interpolator;
 
-import com.android.systemui.Interpolators;
+import com.android.systemui.animation.Interpolators;
 import com.android.systemui.statusbar.notification.ShadeViewRefactor;
 import com.android.systemui.statusbar.notification.row.ExpandableView;
 
@@ -35,12 +35,12 @@ import com.android.systemui.statusbar.notification.row.ExpandableView;
  * bounds change.
  */
 public class NotificationSection {
-    private @PriorityBucket int mBucket;
-    private View mOwningView;
-    private Rect mBounds = new Rect();
-    private Rect mCurrentBounds = new Rect(-1, -1, -1, -1);
-    private Rect mStartAnimationRect = new Rect();
-    private Rect mEndAnimationRect = new Rect();
+    private @PriorityBucket final int mBucket;
+    private final View mOwningView;
+    private final Rect mBounds = new Rect();
+    private final Rect mCurrentBounds = new Rect(-1, -1, -1, -1);
+    private final Rect mStartAnimationRect = new Rect();
+    private final Rect mEndAnimationRect = new Rect();
     private ObjectAnimator mTopAnimator = null;
     private ObjectAnimator mBottomAnimator = null;
     private ExpandableView mFirstVisibleChild;
@@ -277,7 +277,6 @@ public class NotificationSection {
                 }
             }
         }
-        top = Math.max(minTopPosition, top);
         ExpandableView lastView = getLastVisibleChild();
         if (lastView != null) {
             float finalTranslationY = ViewState.getFinalTranslationY(lastView);

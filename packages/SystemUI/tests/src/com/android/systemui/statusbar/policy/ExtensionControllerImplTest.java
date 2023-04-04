@@ -33,7 +33,7 @@ import com.android.systemui.SysuiTestCase;
 import com.android.systemui.plugins.OverlayPlugin;
 import com.android.systemui.plugins.Plugin;
 import com.android.systemui.plugins.PluginListener;
-import com.android.systemui.shared.plugins.PluginManager;
+import com.android.systemui.plugins.PluginManager;
 import com.android.systemui.statusbar.policy.ConfigurationController.ConfigurationListener;
 import com.android.systemui.statusbar.policy.ExtensionController.Extension;
 import com.android.systemui.statusbar.policy.ExtensionController.TunerFactory;
@@ -63,8 +63,12 @@ public class ExtensionControllerImplTest extends SysuiTestCase {
         mPluginManager = mDependency.injectMockDependency(PluginManager.class);
         mTunerService = mDependency.injectMockDependency(TunerService.class);
         mConfigurationController = mDependency.injectMockDependency(ConfigurationController.class);
-        mExtensionController = new ExtensionControllerImpl(mContext,
-                mock(LeakDetector.class), mPluginManager, mTunerService, mConfigurationController);
+        mExtensionController = new ExtensionControllerImpl(
+                mContext,
+                mock(LeakDetector.class),
+                mPluginManager,
+                mTunerService,
+                mConfigurationController);
     }
 
     @Test

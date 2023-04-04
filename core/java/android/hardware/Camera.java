@@ -29,12 +29,14 @@ import android.annotation.SdkConstant;
 import android.annotation.SdkConstant.SdkConstantType;
 import android.app.ActivityThread;
 import android.app.AppOpsManager;
+import android.app.compat.CompatChanges;
 import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.graphics.ImageFormat;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
+import android.hardware.camera2.CameraManager;
 import android.media.AudioAttributes;
 import android.media.IAudioService;
 import android.os.Build;
@@ -45,6 +47,7 @@ import android.os.Message;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.ServiceManager;
+import android.os.SystemProperties;
 import android.renderscript.Allocation;
 import android.renderscript.Element;
 import android.renderscript.RSIllegalArgumentException;
@@ -249,14 +252,10 @@ public class Camera {
     public static final int CAMERA_HAL_API_VERSION_1_0 = 0x100;
 
     /**
-     * A constant meaning the normal camera connect/open will be used.
+     * Camera HAL device API version 3.0
+     * @hide
      */
-    private static final int CAMERA_HAL_API_VERSION_NORMAL_CONNECT = -2;
-
-    /**
-     * Used to indicate HAL version un-specified.
-     */
-    private static final int CAMERA_HAL_API_VERSION_UNSPECIFIED = -1;
+    public static final int CAMERA_HAL_API_VERSION_3_0 = 0x300;
 
     /**
      * Hardware face detection. It does not use much CPU.
@@ -285,6 +284,14 @@ public class Camera {
      */
     public native static int getNumberOfCameras();
 
+    private static final boolean sLandscapeToPortrait =
+            SystemProperties.getBoolean(CameraManager.LANDSCAPE_TO_PORTRAIT_PROP, false);
+
+    private static boolean shouldOverrideToPortrait() {
+        return CompatChanges.isChangeEnabled(CameraManager.OVERRIDE_FRONT_CAMERA_APP_COMPAT)
+                && sLandscapeToPortrait;
+    }
+
     /**
      * Returns the information about a particular camera.
      * If {@link #getNumberOfCameras()} returns N, the valid id is 0 to N-1.
@@ -294,7 +301,9 @@ public class Camera {
      *    low-level failure).
      */
     public static void getCameraInfo(int cameraId, CameraInfo cameraInfo) {
-        _getCameraInfo(cameraId, cameraInfo);
+        boolean overrideToPortrait = shouldOverrideToPortrait();
+
+        _getCameraInfo(cameraId, overrideToPortrait, cameraInfo);
         IBinder b = ServiceManager.getService(Context.AUDIO_SERVICE);
         IAudioService audioService = IAudioService.Stub.asInterface(b);
         try {
@@ -307,7 +316,8 @@ public class Camera {
             Log.e(TAG, "Audio service is unavailable for queries");
         }
     }
-    private native static void _getCameraInfo(int cameraId, CameraInfo cameraInfo);
+    private native static void _getCameraInfo(int cameraId, boolean overrideToPortrait,
+            CameraInfo cameraInfo);
 
     /**
      * Information about a camera
@@ -427,7 +437,7 @@ public class Camera {
      * Creates a new Camera object to access a particular hardware camera with
      * given hal API version. If the same camera is opened by other applications
      * or the hal API version is not supported by this device, this will throw a
-     * RuntimeException.
+     * RuntimeException. As of Android 12, HAL version 1 is no longer supported.
      * <p>
      * You must call {@link #release()} when you are done using the camera,
      * otherwise it will remain locked and be unavailable to other applications.
@@ -463,49 +473,14 @@ public class Camera {
      */
     @UnsupportedAppUsage
     public static Camera openLegacy(int cameraId, int halVersion) {
-        if (halVersion < CAMERA_HAL_API_VERSION_1_0) {
-            throw new IllegalArgumentException("Invalid HAL version " + halVersion);
+        if (halVersion < CAMERA_HAL_API_VERSION_3_0) {
+            throw new IllegalArgumentException("Unsupported HAL version " + halVersion);
         }
 
-        return new Camera(cameraId, halVersion);
+        return new Camera(cameraId);
     }
 
-    /**
-     * Create a legacy camera object.
-     *
-     * @param cameraId The hardware camera to access, between 0 and
-     * {@link #getNumberOfCameras()}-1.
-     * @param halVersion The HAL API version this camera device to be opened as.
-     */
-    private Camera(int cameraId, int halVersion) {
-        int err = cameraInitVersion(cameraId, halVersion);
-        if (checkInitErrors(err)) {
-            if (err == -EACCES) {
-                throw new RuntimeException("Fail to connect to camera service");
-            } else if (err == -ENODEV) {
-                throw new RuntimeException("Camera initialization failed");
-            } else if (err == -ENOSYS) {
-                throw new RuntimeException("Camera initialization failed because some methods"
-                        + " are not implemented");
-            } else if (err == -EOPNOTSUPP) {
-                throw new RuntimeException("Camera initialization failed because the hal"
-                        + " version is not supported by this device");
-            } else if (err == -EINVAL) {
-                throw new RuntimeException("Camera initialization failed because the input"
-                        + " arugments are invalid");
-            } else if (err == -EBUSY) {
-                throw new RuntimeException("Camera initialization failed because the camera"
-                        + " device was already opened");
-            } else if (err == -EUSERS) {
-                throw new RuntimeException("Camera initialization failed because the max"
-                        + " number of camera devices were already opened");
-            }
-            // Should never hit this.
-            throw new RuntimeException("Unknown camera error");
-        }
-    }
-
-    private int cameraInitVersion(int cameraId, int halVersion) {
+    private int cameraInit(int cameraId) {
         mShutterCallback = null;
         mRawImageCallback = null;
         mJpegCallback = null;
@@ -523,35 +498,14 @@ public class Camera {
             mEventHandler = null;
         }
 
-        return native_setup(new WeakReference<Camera>(this), cameraId, halVersion,
-                ActivityThread.currentOpPackageName());
-    }
-
-    private int cameraInitNormal(int cameraId) {
-        return cameraInitVersion(cameraId, CAMERA_HAL_API_VERSION_NORMAL_CONNECT);
-    }
-
-    /**
-     * Connect to the camera service using #connectLegacy
-     *
-     * <p>
-     * This acts the same as normal except that it will return
-     * the detailed error code if open fails instead of
-     * converting everything into {@code NO_INIT}.</p>
-     *
-     * <p>Intended to use by the camera2 shim only, do <i>not</i> use this for other code.</p>
-     *
-     * @return a detailed errno error code, or {@code NO_ERROR} on success
-     *
-     * @hide
-     */
-    public int cameraInitUnspecified(int cameraId) {
-        return cameraInitVersion(cameraId, CAMERA_HAL_API_VERSION_UNSPECIFIED);
+        boolean overrideToPortrait = shouldOverrideToPortrait();
+        return native_setup(new WeakReference<Camera>(this), cameraId,
+                ActivityThread.currentOpPackageName(), overrideToPortrait);
     }
 
     /** used by Camera#open, Camera#open(int) */
     Camera(int cameraId) {
-        int err = cameraInitNormal(cameraId);
+        int err = cameraInit(cameraId);
         if (checkInitErrors(err)) {
             if (err == -EACCES) {
                 throw new RuntimeException("Fail to connect to camera service");
@@ -616,8 +570,8 @@ public class Camera {
     }
 
     @UnsupportedAppUsage
-    private native final int native_setup(Object camera_this, int cameraId, int halVersion,
-                                           String packageName);
+    private native int native_setup(Object cameraThis, int cameraId, String packageName,
+            boolean overrideToPortrait);
 
     private native final void native_release();
 
@@ -2213,7 +2167,7 @@ public class Camera {
          *         same as those of this size. {@code false} otherwise.
          */
         @Override
-        public boolean equals(Object obj) {
+        public boolean equals(@Nullable Object obj) {
             if (!(obj instanceof Size)) {
                 return false;
             }
@@ -2284,7 +2238,7 @@ public class Camera {
          *         the same as those of this area. {@code false} otherwise.
          */
         @Override
-        public boolean equals(Object obj) {
+        public boolean equals(@Nullable Object obj) {
             if (!(obj instanceof Area)) {
                 return false;
             }

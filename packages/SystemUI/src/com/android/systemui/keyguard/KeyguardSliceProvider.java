@@ -17,7 +17,6 @@
 package com.android.systemui.keyguard;
 
 import android.annotation.AnyThread;
-import android.app.ActivityManager;
 import android.app.AlarmManager;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
@@ -49,11 +48,10 @@ import androidx.slice.builders.SliceAction;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.keyguard.KeyguardUpdateMonitor;
 import com.android.keyguard.KeyguardUpdateMonitorCallback;
-import com.android.systemui.Dependency;
 import com.android.systemui.R;
 import com.android.systemui.SystemUIAppComponentFactory;
-import com.android.systemui.SystemUIFactory;
 import com.android.systemui.plugins.statusbar.StatusBarStateController;
+import com.android.systemui.settings.UserTracker;
 import com.android.systemui.statusbar.NotificationMediaManager;
 import com.android.systemui.statusbar.StatusBarState;
 import com.android.systemui.statusbar.phone.DozeParameters;
@@ -72,11 +70,16 @@ import javax.inject.Inject;
 
 /**
  * Simple Slice provider that shows the current date.
+ *
+ * Injection is handled by {@link SystemUIAppComponentFactory} +
+ * {@link com.android.systemui.dagger.GlobalRootComponent#inject(KeyguardSliceProvider)}.
  */
 public class KeyguardSliceProvider extends SliceProvider implements
         NextAlarmController.NextAlarmChangeCallback, ZenModeController.Callback,
         NotificationMediaManager.MediaListener, StatusBarStateController.StateListener,
         SystemUIAppComponentFactory.ContextInitializer {
+
+    private static final String TAG = "KgdSliceProvider";
 
     private static final StyleSpan BOLD_STYLE = new StyleSpan(Typeface.BOLD);
     public static final String KEYGUARD_SLICE_URI = "content://com.android.systemui.keyguard/main";
@@ -135,6 +138,10 @@ public class KeyguardSliceProvider extends SliceProvider implements
     public StatusBarStateController mStatusBarStateController;
     @Inject
     public KeyguardBypassController mKeyguardBypassController;
+    @Inject
+    public KeyguardUpdateMonitor mKeyguardUpdateMonitor;
+    @Inject
+    UserTracker mUserTracker;
     private CharSequence mMediaTitle;
     private CharSequence mMediaArtist;
     protected boolean mDozing;
@@ -298,7 +305,8 @@ public class KeyguardSliceProvider extends SliceProvider implements
     @Override
     public boolean onCreateSliceProvider() {
         mContextAvailableCallback.onContextAvailable(getContext());
-        inject();
+        mMediaWakeLock = new SettableWakeLock(WakeLock.createPartial(getContext(), "media"),
+                "media");
         synchronized (KeyguardSliceProvider.sInstanceLock) {
             KeyguardSliceProvider oldInstance = KeyguardSliceProvider.sInstance;
             if (oldInstance != null) {
@@ -306,7 +314,8 @@ public class KeyguardSliceProvider extends SliceProvider implements
             }
             mDatePattern = getContext().getString(R.string.system_ui_aod_date_pattern);
             mPendingIntent = PendingIntent.getActivity(getContext(), 0,
-                    new Intent(getContext(), KeyguardSliceProvider.class), 0);
+                    new Intent(getContext(), KeyguardSliceProvider.class),
+                    PendingIntent.FLAG_IMMUTABLE);
             mMediaManager.addCallback(this);
             mStatusBarStateController.addCallback(this);
             mNextAlarmController.addCallback(this);
@@ -319,13 +328,6 @@ public class KeyguardSliceProvider extends SliceProvider implements
     }
 
     @VisibleForTesting
-    protected void inject() {
-        SystemUIFactory.getInstance().getRootComponent().inject(this);
-        mMediaWakeLock = new SettableWakeLock(WakeLock.createPartial(getContext(), "media"),
-                "media");
-    }
-
-    @VisibleForTesting
     protected void onDestroy() {
         synchronized (KeyguardSliceProvider.sInstanceLock) {
             mNextAlarmController.removeCallback(this);
@@ -334,7 +336,7 @@ public class KeyguardSliceProvider extends SliceProvider implements
             mAlarmManager.cancel(mUpdateNextAlarm);
             if (mRegistered) {
                 mRegistered = false;
-                getKeyguardUpdateMonitor().removeCallback(mKeyguardUpdateMonitorCallback);
+                mKeyguardUpdateMonitor.removeCallback(mKeyguardUpdateMonitorCallback);
                 getContext().unregisterReceiver(mIntentReceiver);
             }
             KeyguardSliceProvider.sInstance = null;
@@ -355,7 +357,7 @@ public class KeyguardSliceProvider extends SliceProvider implements
         synchronized (this) {
             if (withinNHoursLocked(mNextAlarmInfo, ALARM_VISIBILITY_HOURS)) {
                 String pattern = android.text.format.DateFormat.is24HourFormat(getContext(),
-                        ActivityManager.getCurrentUser()) ? "HH:mm" : "h:mm";
+                        mUserTracker.getUserId()) ? "HH:mm" : "h:mm";
                 mNextAlarm = android.text.format.DateFormat.format(pattern,
                         mNextAlarmInfo.getTriggerTime()).toString();
             } else {
@@ -390,7 +392,7 @@ public class KeyguardSliceProvider extends SliceProvider implements
             filter.addAction(Intent.ACTION_LOCALE_CHANGED);
             getContext().registerReceiver(mIntentReceiver, filter, null /* permission*/,
                     null /* scheduler */);
-            getKeyguardUpdateMonitor().registerCallback(mKeyguardUpdateMonitorCallback);
+            mKeyguardUpdateMonitor.registerCallback(mKeyguardUpdateMonitorCallback);
             mRegistered = true;
         }
     }
@@ -440,10 +442,6 @@ public class KeyguardSliceProvider extends SliceProvider implements
             }
         }
         updateNextAlarm();
-    }
-
-    private KeyguardUpdateMonitor getKeyguardUpdateMonitor() {
-        return Dependency.get(KeyguardUpdateMonitor.class);
     }
 
     /**

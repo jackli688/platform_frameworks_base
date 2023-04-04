@@ -21,6 +21,12 @@ import static android.content.pm.UserInfo.FLAG_PRIMARY;
 import static android.content.pm.UserInfo.FLAG_PROFILE;
 import static android.os.UserHandle.USER_SYSTEM;
 
+import static com.android.internal.widget.LockSettingsInternal.ARM_REBOOT_ERROR_ESCROW_NOT_READY;
+import static com.android.internal.widget.LockSettingsInternal.ARM_REBOOT_ERROR_NONE;
+import static com.android.internal.widget.LockSettingsInternal.ARM_REBOOT_ERROR_PROVIDER_MISMATCH;
+import static com.android.internal.widget.LockSettingsInternal.ARM_REBOOT_ERROR_STORE_ESCROW_KEY;
+
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -44,6 +50,8 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.pm.UserInfo;
 import android.hardware.rebootescrow.IRebootEscrow;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.RemoteException;
@@ -66,6 +74,9 @@ import org.mockito.ArgumentCaptor;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
@@ -106,9 +117,13 @@ public class RebootEscrowManagerTests {
     private MockableRebootEscrowInjected mInjected;
     private RebootEscrowManager mService;
     private SecretKey mAesKey;
+    private MockInjector mMockInjector;
+    private Handler mHandler;
 
     public interface MockableRebootEscrowInjected {
         int getBootCount();
+
+        long getCurrentTimeMillis();
 
         void reportMetric(boolean success, int errorCode, int serviceType, int attemptCount,
                 int escrowDurationInSeconds, int vbmetaDigestStatus, int durationSinceBootComplete);
@@ -117,11 +132,15 @@ public class RebootEscrowManagerTests {
     static class MockInjector extends RebootEscrowManager.Injector {
         private final IRebootEscrow mRebootEscrow;
         private final ResumeOnRebootServiceConnection mServiceConnection;
-        private final RebootEscrowProviderInterface mRebootEscrowProvider;
+        private final RebootEscrowProviderInterface mDefaultRebootEscrowProvider;
         private final UserManager mUserManager;
         private final MockableRebootEscrowInjected mInjected;
         private final RebootEscrowKeyStoreManager mKeyStoreManager;
-        private final boolean mServerBased;
+        private boolean mServerBased;
+        private RebootEscrowProviderInterface mRebootEscrowProviderInUse;
+        private ConnectivityManager.NetworkCallback mNetworkCallback;
+        private Consumer<ConnectivityManager.NetworkCallback> mNetworkConsumer;
+        private boolean mWaitForInternet;
 
         MockInjector(Context context, UserManager userManager,
                 IRebootEscrow rebootEscrow,
@@ -132,6 +151,7 @@ public class RebootEscrowManagerTests {
             mRebootEscrow = rebootEscrow;
             mServiceConnection = null;
             mServerBased = false;
+            mWaitForInternet = false;
             RebootEscrowProviderHalImpl.Injector halInjector =
                     new RebootEscrowProviderHalImpl.Injector() {
                         @Override
@@ -139,7 +159,7 @@ public class RebootEscrowManagerTests {
                             return mRebootEscrow;
                         }
                     };
-            mRebootEscrowProvider = new RebootEscrowProviderHalImpl(halInjector);
+            mDefaultRebootEscrowProvider = new RebootEscrowProviderHalImpl(halInjector);
             mUserManager = userManager;
             mKeyStoreManager = keyStoreManager;
             mInjected = injected;
@@ -154,9 +174,21 @@ public class RebootEscrowManagerTests {
             mServiceConnection = serviceConnection;
             mRebootEscrow = null;
             mServerBased = true;
+            mWaitForInternet = false;
             RebootEscrowProviderServerBasedImpl.Injector injector =
-                    new RebootEscrowProviderServerBasedImpl.Injector(serviceConnection);
-            mRebootEscrowProvider = new RebootEscrowProviderServerBasedImpl(storage, injector);
+                    new RebootEscrowProviderServerBasedImpl.Injector(serviceConnection) {
+                        @Override
+                        long getServiceTimeoutInSeconds() {
+                            return 30;
+                        }
+
+                        @Override
+                        long getServerBlobLifetimeInMillis() {
+                            return 600_000;
+                        }
+                    };
+            mDefaultRebootEscrowProvider = new RebootEscrowProviderServerBasedImpl(
+                    storage, injector);
             mUserManager = userManager;
             mKeyStoreManager = keyStoreManager;
             mInjected = injected;
@@ -178,8 +210,46 @@ public class RebootEscrowManagerTests {
         }
 
         @Override
+        public boolean waitForInternet() {
+            return mWaitForInternet;
+        }
+
+        public void setWaitForNetwork(boolean waitForNetworkEnabled) {
+            mWaitForInternet = waitForNetworkEnabled;
+        }
+
+        @Override
+        public boolean isNetworkConnected() {
+            return false;
+        }
+
+        @Override
+        public boolean requestNetworkWithInternet(
+                ConnectivityManager.NetworkCallback networkCallback) {
+            mNetworkCallback = networkCallback;
+            mNetworkConsumer.accept(networkCallback);
+            return true;
+        }
+
+        @Override
+        public void stopRequestingNetwork(ConnectivityManager.NetworkCallback networkCallback) {
+            mNetworkCallback = null;
+        }
+
+        @Override
+        public RebootEscrowProviderInterface createRebootEscrowProviderIfNeeded() {
+            mRebootEscrowProviderInUse = mDefaultRebootEscrowProvider;
+            return mRebootEscrowProviderInUse;
+        }
+
+        @Override
         public RebootEscrowProviderInterface getRebootEscrowProvider() {
-            return mRebootEscrowProvider;
+            return mRebootEscrowProviderInUse;
+        }
+
+        @Override
+        public void clearRebootEscrowProvider() {
+            mRebootEscrowProviderInUse = null;
         }
 
         @Override
@@ -205,9 +275,26 @@ public class RebootEscrowManagerTests {
         }
 
         @Override
+        public int getLoadEscrowTimeoutMillis() {
+            // Timeout in 3 seconds.
+            return 3000;
+        }
+
+        @Override
+        public String getVbmetaDigest(boolean other) {
+            return other ? "" : "fake digest";
+        }
+
+        @Override
+        public long getCurrentTimeMillis() {
+            return mInjected.getCurrentTimeMillis();
+        }
+
+        @Override
         public void reportMetric(boolean success, int errorCode, int serviceType, int attemptCount,
                 int escrowDurationInSeconds, int vbmetaDigestStatus,
                 int durationSinceBootComplete) {
+
             mInjected.reportMetric(success, errorCode, serviceType, attemptCount,
                     escrowDurationInSeconds, vbmetaDigestStatus, durationSinceBootComplete);
         }
@@ -240,13 +327,32 @@ public class RebootEscrowManagerTests {
         when(mCallbacks.isUserSecure(NONSECURE_SECONDARY_USER_ID)).thenReturn(false);
         when(mCallbacks.isUserSecure(SECURE_SECONDARY_USER_ID)).thenReturn(true);
         mInjected = mock(MockableRebootEscrowInjected.class);
-        mService = new RebootEscrowManager(new MockInjector(mContext, mUserManager, mRebootEscrow,
-                mKeyStoreManager, mStorage, mInjected), mCallbacks, mStorage);
+        mMockInjector = new MockInjector(mContext, mUserManager, mRebootEscrow,
+                mKeyStoreManager, mStorage, mInjected);
+        HandlerThread thread = new HandlerThread("RebootEscrowManagerTest");
+        thread.start();
+        mHandler = new Handler(thread.getLooper());
+        mService = new RebootEscrowManager(mMockInjector, mCallbacks, mStorage, mHandler);
+
     }
 
     private void setServerBasedRebootEscrowProvider() throws Exception {
-        mService = new RebootEscrowManager(new MockInjector(mContext, mUserManager,
-                mServiceConnection, mKeyStoreManager, mStorage, mInjected), mCallbacks, mStorage);
+        mMockInjector = new MockInjector(mContext, mUserManager, mServiceConnection,
+                mKeyStoreManager, mStorage, mInjected);
+        mService = new RebootEscrowManager(mMockInjector, mCallbacks, mStorage, mHandler);
+    }
+
+    private void waitForHandler() throws InterruptedException {
+        // Wait for handler to complete processing.
+        CountDownLatch latch = new CountDownLatch(1);
+        mHandler.post(latch::countDown);
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+
+    }
+
+    private void callToRebootEscrowIfNeededAndWait(int userId) throws InterruptedException {
+        mService.callToRebootEscrowIfNeeded(userId, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        waitForHandler();
     }
 
     @Test
@@ -256,7 +362,7 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
         verify(mRebootEscrow, never()).storeKey(any());
     }
@@ -268,8 +374,7 @@ public class RebootEscrowManagerTests {
         mService.setRebootEscrowListener(mockListener);
         mService.prepareRebootEscrow();
 
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
-        verify(mockListener).onPreparedForReboot(eq(true));
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
         assertFalse(mStorage.hasRebootEscrowServerBlob());
     }
@@ -279,7 +384,7 @@ public class RebootEscrowManagerTests {
         RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
         mService.setRebootEscrowListener(mockListener);
         mService.prepareRebootEscrow();
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
 
         clearInvocations(mRebootEscrow);
@@ -293,6 +398,7 @@ public class RebootEscrowManagerTests {
         doThrow(ServiceSpecificException.class).when(mRebootEscrow).storeKey(any());
         mService.clearRebootEscrow();
         verify(mRebootEscrow).storeKey(eq(new byte[32]));
+        assertNull(mMockInjector.getRebootEscrowProvider());
     }
 
     @Test
@@ -302,13 +408,13 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
         verify(mRebootEscrow, never()).storeKey(any());
 
         assertNull(
                 mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         assertNotNull(
                 mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
         verify(mRebootEscrow).storeKey(any());
@@ -326,13 +432,13 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mServiceConnection);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
         verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
 
         when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
 
         assertTrue(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
@@ -347,14 +453,14 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
         verify(mRebootEscrow, never()).storeKey(any());
 
         assertNull(
                 mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
         doThrow(ServiceSpecificException.class).when(mRebootEscrow).storeKey(any());
-        assertFalse(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_STORE_ESCROW_KEY, mService.armRebootEscrowIfNeeded());
         verify(mRebootEscrow).storeKey(any());
     }
 
@@ -365,10 +471,9 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
-        mService.callToRebootEscrowIfNeeded(SECURE_SECONDARY_USER_ID, FAKE_SP_VERSION,
-                FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(SECURE_SECONDARY_USER_ID);
         verify(mRebootEscrow, never()).storeKey(any());
 
         assertTrue(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
@@ -377,7 +482,7 @@ public class RebootEscrowManagerTests {
 
         assertNull(
                 mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         assertNotNull(
                 mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
         verify(mRebootEscrow, times(1)).storeKey(any());
@@ -389,20 +494,29 @@ public class RebootEscrowManagerTests {
 
     @Test
     public void armService_NoInitialization_Failure() throws Exception {
-        assertFalse(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_ESCROW_NOT_READY, mService.armRebootEscrowIfNeeded());
         verifyNoMoreInteractions(mRebootEscrow);
     }
 
     @Test
     public void armService_RebootEscrowServiceException_Failure() throws Exception {
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mRebootEscrow);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mRebootEscrow, never()).storeKey(any());
+
         doThrow(RemoteException.class).when(mRebootEscrow).storeKey(any());
-        assertFalse(mService.armRebootEscrowIfNeeded());
-        verifyNoMoreInteractions(mRebootEscrow);
+        assertEquals(ARM_REBOOT_ERROR_STORE_ESCROW_KEY, mService.armRebootEscrowIfNeeded());
+        verify(mRebootEscrow).storeKey(any());
     }
 
     @Test
     public void loadRebootEscrowDataIfAvailable_NothingAvailable_Success() throws Exception {
-        mService.loadRebootEscrowDataIfAvailable(null);
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
     }
 
     @Test
@@ -414,13 +528,13 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
 
         verify(mRebootEscrow, never()).storeKey(any());
 
         ArgumentCaptor<byte[]> keyByteCaptor = ArgumentCaptor.forClass(byte[].class);
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mRebootEscrow).storeKey(keyByteCaptor.capture());
         verify(mKeyStoreManager).getKeyStoreEncryptionKey();
 
@@ -430,16 +544,21 @@ public class RebootEscrowManagerTests {
         // pretend reboot happens here
 
         when(mInjected.getBootCount()).thenReturn(1);
+        when(mInjected.getCurrentTimeMillis()).thenReturn(30000L);
+        mStorage.setLong(RebootEscrowManager.REBOOT_ESCROW_KEY_ARMED_TIMESTAMP, 10000L,
+                USER_SYSTEM);
         ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
         doNothing().when(mInjected).reportMetric(metricsSuccessCaptor.capture(),
                 eq(0) /* error code */, eq(1) /* HAL based */, eq(1) /* attempt count */,
-                anyInt(), anyInt(), anyInt());
+                eq(20), eq(0) /* vbmeta status */, anyInt());
         when(mRebootEscrow.retrieveKey()).thenAnswer(invocation -> keyByteCaptor.getValue());
 
-        mService.loadRebootEscrowDataIfAvailable(null);
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
         verify(mRebootEscrow).retrieveKey();
         assertTrue(metricsSuccessCaptor.getValue());
         verify(mKeyStoreManager).clearKeyStoreEncryptionKey();
+        assertEquals(mStorage.getLong(RebootEscrowManager.REBOOT_ESCROW_KEY_ARMED_TIMESTAMP,
+                -1, USER_SYSTEM), -1);
     }
 
     @Test
@@ -452,23 +571,30 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mServiceConnection);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
         verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
 
         // Use x -> x for both wrap & unwrap functions.
         when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
         assertTrue(mStorage.hasRebootEscrowServerBlob());
 
         // pretend reboot happens here
         when(mInjected.getBootCount()).thenReturn(1);
         ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
-        doNothing().when(mInjected).reportMetric(metricsSuccessCaptor.capture(),
-                eq(0) /* error code */, eq(2) /* Server based */, eq(1) /* attempt count */,
-                anyInt(), anyInt(), anyInt());
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        eq(0) /* error code */,
+                        eq(2) /* Server based */,
+                        eq(1) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
 
         when(mServiceConnection.unwrap(any(), anyLong()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
@@ -476,6 +602,98 @@ public class RebootEscrowManagerTests {
         verify(mServiceConnection).unwrap(any(), anyLong());
         assertTrue(metricsSuccessCaptor.getValue());
         verify(mKeyStoreManager).clearKeyStoreEncryptionKey();
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_ServerBasedRemoteException_Failure()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(1) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        when(mServiceConnection.unwrap(any(), anyLong())).thenThrow(RemoteException.class);
+        mService.loadRebootEscrowDataIfAvailable(null);
+        verify(mServiceConnection).unwrap(any(), anyLong());
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_LOAD_ESCROW_KEY),
+                metricsErrorCodeCaptor.getValue());
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_ServerBasedIoError_RetryFailure() throws Exception {
+        setServerBasedRebootEscrowProvider();
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(2) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+        when(mServiceConnection.unwrap(any(), anyLong())).thenThrow(IOException.class);
+
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        // Sleep 5s for the retry to complete
+        Thread.sleep(5 * 1000);
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_NO_NETWORK),
+                metricsErrorCodeCaptor.getValue());
     }
 
     @Test
@@ -488,35 +706,482 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mServiceConnection);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
         verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
 
         // Use x -> x for both wrap & unwrap functions.
         when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
         assertTrue(mStorage.hasRebootEscrowServerBlob());
 
         // pretend reboot happens here
         when(mInjected.getBootCount()).thenReturn(1);
         ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
-        doNothing().when(mInjected).reportMetric(metricsSuccessCaptor.capture(),
-                anyInt(), anyInt(), eq(2) /* attempt count */, anyInt(), anyInt(), anyInt());
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        anyInt(),
+                        anyInt(),
+                        eq(2) /* attempt count */,
+                        anyInt(),
+                        anyInt(),
+                        anyInt());
 
         when(mServiceConnection.unwrap(any(), anyLong()))
                 .thenThrow(new IOException())
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
-        HandlerThread thread = new HandlerThread("RebootEscrowManagerTest");
-        thread.start();
-        mService.loadRebootEscrowDataIfAvailable(new Handler(thread.getLooper()));
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
         // Sleep 5s for the retry to complete
         Thread.sleep(5 * 1000);
         verify(mServiceConnection, times(2)).unwrap(any(), anyLong());
         assertTrue(metricsSuccessCaptor.getValue());
         verify(mKeyStoreManager).clearKeyStoreEncryptionKey();
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_serverBasedWaitForInternet_success()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        eq(0) /* error code */,
+                        eq(2) /* Server based */,
+                        eq(1) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        // load escrow data
+        when(mServiceConnection.unwrap(any(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        Network mockNetwork = mock(Network.class);
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    callback.onAvailable(mockNetwork);
+                };
+
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        verify(mServiceConnection).unwrap(any(), anyLong());
+        assertTrue(metricsSuccessCaptor.getValue());
+        verify(mKeyStoreManager).clearKeyStoreEncryptionKey();
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_serverBasedWaitForInternetRemoteException_Failure()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(1) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        // load escrow data
+        when(mServiceConnection.unwrap(any(), anyLong())).thenThrow(RemoteException.class);
+        Network mockNetwork = mock(Network.class);
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    callback.onAvailable(mockNetwork);
+                };
+
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        verify(mServiceConnection).unwrap(any(), anyLong());
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_LOAD_ESCROW_KEY),
+                metricsErrorCodeCaptor.getValue());
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_waitForInternet_networkUnavailable()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(0) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        // Network is not available within timeout.
+        mMockInjector.mNetworkConsumer = ConnectivityManager.NetworkCallback::onUnavailable;
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_NO_NETWORK),
+                metricsErrorCodeCaptor.getValue());
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_waitForInternet_networkLost() throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(2) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        // Network is available, then lost.
+        when(mServiceConnection.unwrap(any(), anyLong())).thenThrow(new IOException());
+        Network mockNetwork = mock(Network.class);
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    callback.onAvailable(mockNetwork);
+                    callback.onLost(mockNetwork);
+                };
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        // Sleep 5s for the retry to complete
+        Thread.sleep(5 * 1000);
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_NO_NETWORK),
+                metricsErrorCodeCaptor.getValue());
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_waitForInternet_networkAvailableWithDelay()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(1) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        // load escrow data
+        when(mServiceConnection.unwrap(any(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        // network available after 1 sec
+        Network mockNetwork = mock(Network.class);
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                    callback.onAvailable(mockNetwork);
+                };
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        verify(mServiceConnection).unwrap(any(), anyLong());
+        assertTrue(metricsSuccessCaptor.getValue());
+        verify(mKeyStoreManager).clearKeyStoreEncryptionKey();
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_waitForInternet_timeoutExhausted()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(1) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        // load reboot escrow data
+        when(mServiceConnection.unwrap(any(), anyLong())).thenThrow(IOException.class);
+        Network mockNetwork = mock(Network.class);
+        // wait past timeout
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    try {
+                        Thread.sleep(3500);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                    callback.onAvailable(mockNetwork);
+                };
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        verify(mServiceConnection).unwrap(any(), anyLong());
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_TIMEOUT_EXHAUSTED),
+                metricsErrorCodeCaptor.getValue());
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_serverBasedWaitForNetwork_retryCountExhausted()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        metricsErrorCodeCaptor.capture(),
+                        eq(2) /* Server based */,
+                        eq(2) /* attempt count */,
+                        anyInt(),
+                        eq(0) /* vbmeta status */,
+                        anyInt());
+
+        when(mServiceConnection.unwrap(any(), anyLong())).thenThrow(new IOException());
+        Network mockNetwork = mock(Network.class);
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    callback.onAvailable(mockNetwork);
+                };
+
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        // Sleep 5s for the retry to complete
+        Thread.sleep(5 * 1000);
+        verify(mServiceConnection, times(2)).unwrap(any(), anyLong());
+        assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(
+                Integer.valueOf(RebootEscrowManager.ERROR_RETRY_COUNT_EXHAUSTED),
+                metricsErrorCodeCaptor.getValue());
+        assertNull(mMockInjector.mNetworkCallback);
+    }
+
+    @Test
+    public void loadRebootEscrowDataIfAvailable_ServerBasedWaitForInternet_RetrySuccess()
+            throws Exception {
+        setServerBasedRebootEscrowProvider();
+        mMockInjector.setWaitForNetwork(true);
+
+        when(mInjected.getBootCount()).thenReturn(0);
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mServiceConnection);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        verify(mServiceConnection, never()).wrapBlob(any(), anyLong(), anyLong());
+
+        // Use x -> x for both wrap & unwrap functions.
+        when(mServiceConnection.wrapBlob(any(), anyLong(), anyLong()))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
+        verify(mServiceConnection).wrapBlob(any(), anyLong(), anyLong());
+        assertTrue(mStorage.hasRebootEscrowServerBlob());
+
+        // pretend reboot happens here
+        when(mInjected.getBootCount()).thenReturn(1);
+        ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        doNothing()
+                .when(mInjected)
+                .reportMetric(
+                        metricsSuccessCaptor.capture(),
+                        anyInt(),
+                        anyInt(),
+                        eq(2) /* attempt count */,
+                        anyInt(),
+                        anyInt(),
+                        anyInt());
+
+        when(mServiceConnection.unwrap(any(), anyLong()))
+                .thenThrow(new IOException())
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        Network mockNetwork = mock(Network.class);
+        mMockInjector.mNetworkConsumer =
+                (callback) -> {
+                    callback.onAvailable(mockNetwork);
+                };
+
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
+        // Sleep 5s for the retry to complete
+        Thread.sleep(5 * 1000);
+        verify(mServiceConnection, times(2)).unwrap(any(), anyLong());
+        assertTrue(metricsSuccessCaptor.getValue());
+        verify(mKeyStoreManager).clearKeyStoreEncryptionKey();
+        assertNull(mMockInjector.mNetworkCallback);
     }
 
     @Test
@@ -528,12 +1193,12 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
 
         verify(mRebootEscrow, never()).storeKey(any());
 
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mRebootEscrow).storeKey(any());
 
         assertTrue(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
@@ -544,7 +1209,7 @@ public class RebootEscrowManagerTests {
         when(mInjected.getBootCount()).thenReturn(10);
         when(mRebootEscrow.retrieveKey()).thenReturn(new byte[32]);
 
-        mService.loadRebootEscrowDataIfAvailable(null);
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
         verify(mRebootEscrow).retrieveKey();
         verify(mInjected, never()).reportMetric(anyBoolean(), anyInt(), anyInt(), anyInt(),
                 anyInt(), anyInt(), anyInt());
@@ -559,7 +1224,7 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
 
         verify(mRebootEscrow, never()).storeKey(any());
@@ -572,7 +1237,7 @@ public class RebootEscrowManagerTests {
         when(mInjected.getBootCount()).thenReturn(10);
         when(mRebootEscrow.retrieveKey()).thenReturn(new byte[32]);
 
-        mService.loadRebootEscrowDataIfAvailable(null);
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
         verify(mInjected, never()).reportMetric(anyBoolean(), anyInt(), anyInt(), anyInt(),
                 anyInt(), anyInt(), anyInt());
     }
@@ -587,13 +1252,13 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
 
         verify(mRebootEscrow, never()).storeKey(any());
 
         ArgumentCaptor<byte[]> keyByteCaptor = ArgumentCaptor.forClass(byte[].class);
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mRebootEscrow).storeKey(keyByteCaptor.capture());
 
         assertTrue(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
@@ -607,9 +1272,14 @@ public class RebootEscrowManagerTests {
         when(mInjected.getBootCount()).thenReturn(10);
         when(mRebootEscrow.retrieveKey()).thenAnswer(invocation -> keyByteCaptor.getValue());
 
-        mService.loadRebootEscrowDataIfAvailable(null);
+        // Trigger a vbmeta digest mismatch
+        mStorage.setString(RebootEscrowManager.REBOOT_ESCROW_KEY_VBMETA_DIGEST,
+                "non sense value", USER_SYSTEM);
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
         verify(mInjected).reportMetric(eq(true), eq(0) /* error code */, eq(1) /* HAL based */,
-                eq(1) /* attempt count */, anyInt(), anyInt(), anyInt());
+                eq(1) /* attempt count */, anyInt(), eq(2) /* vbmeta status */, anyInt());
+        assertEquals(mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_KEY_VBMETA_DIGEST,
+                "", USER_SYSTEM), "");
     }
 
     @Test
@@ -621,12 +1291,11 @@ public class RebootEscrowManagerTests {
         mService.prepareRebootEscrow();
 
         clearInvocations(mRebootEscrow);
-        mService.callToRebootEscrowIfNeeded(PRIMARY_USER_ID, FAKE_SP_VERSION, FAKE_AUTH_TOKEN);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
         verify(mockListener).onPreparedForReboot(eq(true));
 
         verify(mRebootEscrow, never()).storeKey(any());
-
-        assertTrue(mService.armRebootEscrowIfNeeded());
+        assertEquals(ARM_REBOOT_ERROR_NONE, mService.armRebootEscrowIfNeeded());
         verify(mRebootEscrow).storeKey(any());
 
         assertTrue(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
@@ -636,12 +1305,41 @@ public class RebootEscrowManagerTests {
 
         when(mInjected.getBootCount()).thenReturn(1);
         ArgumentCaptor<Boolean> metricsSuccessCaptor = ArgumentCaptor.forClass(Boolean.class);
+        ArgumentCaptor<Integer> metricsErrorCodeCaptor = ArgumentCaptor.forClass(Integer.class);
+        // Return a null escrow key
         doNothing().when(mInjected).reportMetric(metricsSuccessCaptor.capture(),
-                anyInt() /* error code */, eq(1) /* HAL based */, eq(1) /* attempt count */,
-                anyInt(), anyInt(), anyInt());
-        when(mRebootEscrow.retrieveKey()).thenAnswer(invocation -> new byte[32]);
-        mService.loadRebootEscrowDataIfAvailable(null);
+                metricsErrorCodeCaptor.capture(), eq(1) /* HAL based */,
+                eq(1) /* attempt count */, anyInt(), anyInt(), anyInt());
+
+        when(mRebootEscrow.retrieveKey()).thenAnswer(invocation -> null);
+        mService.loadRebootEscrowDataIfAvailable(mHandler);
         verify(mRebootEscrow).retrieveKey();
         assertFalse(metricsSuccessCaptor.getValue());
+        assertEquals(Integer.valueOf(RebootEscrowManager.ERROR_LOAD_ESCROW_KEY),
+                metricsErrorCodeCaptor.getValue());
+    }
+
+    @Test
+    public void armServiceProviderMismatch_Failure() throws Exception {
+        RebootEscrowListener mockListener = mock(RebootEscrowListener.class);
+        mService.setRebootEscrowListener(mockListener);
+        mService.prepareRebootEscrow();
+
+        clearInvocations(mRebootEscrow);
+        callToRebootEscrowIfNeededAndWait(PRIMARY_USER_ID);
+        verify(mockListener).onPreparedForReboot(eq(true));
+        assertTrue(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
+        verify(mRebootEscrow, never()).storeKey(any());
+
+        assertNull(
+                mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
+        // Change the provider to server based, expect the reboot to fail
+        mMockInjector.mServerBased = true;
+        assertEquals(ARM_REBOOT_ERROR_PROVIDER_MISMATCH, mService.armRebootEscrowIfNeeded());
+        assertNull(
+                mStorage.getString(RebootEscrowManager.REBOOT_ESCROW_ARMED_KEY, null, USER_SYSTEM));
+        // Verify that the escrow key & data have been cleared.
+        verify(mRebootEscrow).storeKey(eq(new byte[32]));
+        assertFalse(mStorage.hasRebootEscrow(PRIMARY_USER_ID));
     }
 }

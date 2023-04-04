@@ -19,7 +19,11 @@ package com.android.internal.inputmethod;
 import static java.lang.annotation.RetentionPolicy.SOURCE;
 
 import android.annotation.IntDef;
+import android.os.IBinder;
+import android.view.WindowManager;
 import android.view.WindowManager.LayoutParams;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
 
 import java.lang.annotation.Retention;
 
@@ -30,9 +34,9 @@ import java.lang.annotation.Retention;
 @IntDef(value = {
         SoftInputShowHideReason.SHOW_SOFT_INPUT,
         SoftInputShowHideReason.ATTACH_NEW_INPUT,
-        SoftInputShowHideReason.SHOW_MY_SOFT_INPUT,
+        SoftInputShowHideReason.SHOW_SOFT_INPUT_FROM_IME,
         SoftInputShowHideReason.HIDE_SOFT_INPUT,
-        SoftInputShowHideReason.HIDE_MY_SOFT_INPUT,
+        SoftInputShowHideReason.HIDE_SOFT_INPUT_FROM_IME,
         SoftInputShowHideReason.SHOW_AUTO_EDITOR_FORWARD_NAV,
         SoftInputShowHideReason.SHOW_STATE_VISIBLE_FORWARD_NAV,
         SoftInputShowHideReason.SHOW_STATE_ALWAYS_VISIBLE,
@@ -48,7 +52,18 @@ import java.lang.annotation.Retention;
         SoftInputShowHideReason.HIDE_DOCKED_STACK_ATTACHED,
         SoftInputShowHideReason.HIDE_RECENTS_ANIMATION,
         SoftInputShowHideReason.HIDE_BUBBLES,
-        SoftInputShowHideReason.HIDE_SAME_WINDOW_FOCUSED_WITHOUT_EDITOR})
+        SoftInputShowHideReason.HIDE_SAME_WINDOW_FOCUSED_WITHOUT_EDITOR,
+        SoftInputShowHideReason.HIDE_REMOVE_CLIENT,
+        SoftInputShowHideReason.SHOW_RESTORE_IME_VISIBILITY,
+        SoftInputShowHideReason.SHOW_TOGGLE_SOFT_INPUT,
+        SoftInputShowHideReason.HIDE_TOGGLE_SOFT_INPUT,
+        SoftInputShowHideReason.SHOW_SOFT_INPUT_BY_INSETS_API,
+        SoftInputShowHideReason.HIDE_DISPLAY_IME_POLICY_HIDE,
+        SoftInputShowHideReason.HIDE_SOFT_INPUT_BY_INSETS_API,
+        SoftInputShowHideReason.HIDE_SOFT_INPUT_BY_BACK_KEY,
+        SoftInputShowHideReason.HIDE_SOFT_INPUT_IME_TOGGLE_SOFT_INPUT,
+        SoftInputShowHideReason.HIDE_SOFT_INPUT_EXTRACT_INPUT_CHANGED,
+        SoftInputShowHideReason.HIDE_SOFT_INPUT_IMM_DEPRECATION})
 public @interface SoftInputShowHideReason {
     /** Show soft input by {@link android.view.inputmethod.InputMethodManager#showSoftInput}. */
     int SHOW_SOFT_INPUT = 0;
@@ -56,8 +71,12 @@ public @interface SoftInputShowHideReason {
     /** Show soft input when {@code InputMethodManagerService#attachNewInputLocked} called. */
     int ATTACH_NEW_INPUT = 1;
 
-    /** Show soft input by {@code InputMethodManagerService#showMySoftInput}. */
-    int SHOW_MY_SOFT_INPUT = 2;
+    /** Show soft input by {@code InputMethodManagerService#showMySoftInput}. This is triggered when
+     *  the IME process try to show the keyboard.
+     *
+     * @see android.inputmethodservice.InputMethodService#requestShowSelf(int)
+     */
+    int SHOW_SOFT_INPUT_FROM_IME = 2;
 
     /**
      * Hide soft input by
@@ -65,8 +84,11 @@ public @interface SoftInputShowHideReason {
      */
     int HIDE_SOFT_INPUT = 3;
 
-    /** Hide soft input by {@code InputMethodManagerService#hideMySoftInput}. */
-    int HIDE_MY_SOFT_INPUT = 4;
+    /**
+     * Hide soft input by
+     * {@link android.inputmethodservice.InputMethodService#requestHideSelf(int)}.
+     */
+    int HIDE_SOFT_INPUT_FROM_IME = 4;
 
     /**
      * Show soft input when navigated forward to the window (with
@@ -144,7 +166,7 @@ public @interface SoftInputShowHideReason {
     int HIDE_RECENTS_ANIMATION = 18;
 
     /**
-     * Hide soft input when {@link com.android.systemui.bubbles.BubbleController} is expanding,
+     * Hide soft input when {@link com.android.wm.shell.bubbles.BubbleController} is expanding,
      * switching, or collapsing Bubbles.
      */
     int HIDE_BUBBLES = 19;
@@ -161,4 +183,67 @@ public @interface SoftInputShowHideReason {
      * soft-input when the same window focused again to align with the same behavior prior to R.
      */
     int HIDE_SAME_WINDOW_FOCUSED_WITHOUT_EDITOR = 20;
+
+    /**
+     * Hide soft input when a {@link com.android.internal.view.IInputMethodClient} is removed.
+     */
+    int HIDE_REMOVE_CLIENT = 21;
+
+    /**
+     * Show soft input when the system invoking
+     * {@link com.android.server.wm.WindowManagerInternal#shouldRestoreImeVisibility}.
+     */
+    int SHOW_RESTORE_IME_VISIBILITY = 22;
+
+    /**
+     * Show soft input by
+     * {@link android.view.inputmethod.InputMethodManager#toggleSoftInput(int, int)};
+     */
+    int SHOW_TOGGLE_SOFT_INPUT = 23;
+
+    /**
+     * Hide soft input by
+     * {@link android.view.inputmethod.InputMethodManager#toggleSoftInput(int, int)};
+     */
+    int HIDE_TOGGLE_SOFT_INPUT = 24;
+
+    /**
+     * Show soft input by
+     * {@link android.view.InsetsController#show(int)};
+     */
+    int SHOW_SOFT_INPUT_BY_INSETS_API = 25;
+
+    /**
+     * Hide soft input if Ime policy has been set to {@link WindowManager#DISPLAY_IME_POLICY_HIDE}.
+     * See also {@code InputMethodManagerService#mImeHiddenByDisplayPolicy}.
+     */
+    int HIDE_DISPLAY_IME_POLICY_HIDE = 26;
+
+    /**
+     * Hide soft input by {@link android.view.InsetsController#hide(int)}.
+     */
+    int HIDE_SOFT_INPUT_BY_INSETS_API = 27;
+
+    /**
+     * Hide soft input by {@link android.inputmethodservice.InputMethodService#handleBack(boolean)}.
+     */
+    int HIDE_SOFT_INPUT_BY_BACK_KEY = 28;
+
+    /**
+     * Hide soft input by
+     * {@link android.inputmethodservice.InputMethodService#onToggleSoftInput(int, int)}.
+     */
+    int HIDE_SOFT_INPUT_IME_TOGGLE_SOFT_INPUT = 29;
+
+    /**
+     * Hide soft input by
+     * {@link android.inputmethodservice.InputMethodService#onExtractingInputChanged(EditorInfo)})}.
+     */
+    int HIDE_SOFT_INPUT_EXTRACT_INPUT_CHANGED = 30;
+
+    /**
+     * Hide soft input by the deprecated
+     * {@link InputMethodManager#hideSoftInputFromInputMethod(IBinder, int)}.
+     */
+    int HIDE_SOFT_INPUT_IMM_DEPRECATION = 31;
 }

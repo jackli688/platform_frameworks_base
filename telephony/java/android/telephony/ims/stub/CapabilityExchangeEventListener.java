@@ -26,7 +26,7 @@ import android.telephony.ims.RcsUceAdapter;
 import android.telephony.ims.feature.ImsFeature;
 import android.telephony.ims.feature.RcsFeature;
 
-import java.util.List;
+import java.util.Set;
 
 /**
  * The interface that is used by the framework to listen to events from the vendor RCS stack
@@ -90,6 +90,30 @@ public interface CapabilityExchangeEventListener {
     void onUnpublish() throws ImsException;
 
     /**
+     * Notify the framework that the ImsService has refreshed the PUBLISH
+     * internally, which has resulted in a new PUBLISH result.
+     * <p>
+     * This method must be called to notify the framework of SUCCESS (200 OK) and FAILURE (300+)
+     * codes in order to keep the AOSP stack up to date.
+     * @param reasonCode The SIP response code sent from the network.
+     * @param reasonPhrase The optional reason response from the network. If the
+     * network provided no reason with the sip code, the string should be empty.
+     * @param reasonHeaderCause The “cause” parameter of the “reason” header
+     * included in the SIP message.
+     * @param reasonHeaderText The “text” parameter of the “reason” header
+     * included in the SIP message.
+     * @throws ImsException If this {@link RcsCapabilityExchangeImplBase} instance is not
+     * currently connected to the framework. This can happen if the {@link RcsFeature} is not
+     * {@link ImsFeature#STATE_READY} and the {@link RcsFeature} has not received
+     * the {@link ImsFeature#onFeatureReady()} callback. This may also happen in rare
+     * cases when the Telephony stack has crashed.
+     *
+     */
+    default void onPublishUpdated(int reasonCode, @NonNull String reasonPhrase,
+            int reasonHeaderCause, @NonNull String reasonHeaderText) throws ImsException {
+    }
+
+    /**
      * Inform the framework of an OPTIONS query from a remote device for this device's UCE
      * capabilities.
      * <p>
@@ -98,7 +122,8 @@ public interface CapabilityExchangeEventListener {
      * {@link OptionsRequestCallback#onRespondToCapabilityRequestWithError}.
      * @param contactUri The URI associated with the remote contact that is
      * requesting capabilities.
-     * @param remoteCapabilities The remote contact's capability information.
+     * @param remoteCapabilities The remote contact's capability information. The capability
+     * information is in the format defined in RCC.07 section 2.6.1.3.
      * @param callback The callback of this request which is sent from the remote user.
      * @throws ImsException If this {@link RcsCapabilityExchangeImplBase} instance is not
      * currently connected to the framework. This can happen if the {@link RcsFeature} is not
@@ -107,6 +132,6 @@ public interface CapabilityExchangeEventListener {
      * cases when the Telephony stack has crashed.
      */
     void onRemoteCapabilityRequest(@NonNull Uri contactUri,
-            @NonNull List<String> remoteCapabilities,
+            @NonNull Set<String> remoteCapabilities,
             @NonNull OptionsRequestCallback callback) throws ImsException;
 }

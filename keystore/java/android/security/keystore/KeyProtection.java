@@ -24,6 +24,7 @@ import android.app.KeyguardManager;
 import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricPrompt;
 import android.security.GateKeeper;
+import android.security.keystore2.KeymasterUtils;
 
 import java.security.Key;
 import java.security.KeyStore.ProtectionParameter;
@@ -1047,7 +1048,6 @@ public final class KeyProtection implements ProtectionParameter, UserAuthArgs {
 
         /**
          * Sets whether this key should be protected by a StrongBox security chip.
-         * @hide
          */
         @NonNull
         public Builder setIsStrongBoxBacked(boolean isStrongBoxBacked) {

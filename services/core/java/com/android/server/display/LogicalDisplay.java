@@ -16,10 +16,17 @@
 
 package com.android.server.display;
 
+import static com.android.server.display.DisplayDeviceInfo.TOUCH_NONE;
+
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.hardware.display.DisplayManagerInternal;
+import android.util.ArraySet;
+import android.util.SparseArray;
 import android.view.Display;
+import android.view.DisplayEventReceiver;
 import android.view.DisplayInfo;
 import android.view.Surface;
 import android.view.SurfaceControl;
@@ -27,8 +34,8 @@ import android.view.SurfaceControl;
 import com.android.server.wm.utils.InsetUtils;
 
 import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Objects;
 
 /**
@@ -58,14 +65,20 @@ import java.util.Objects;
  * </p>
  */
 final class LogicalDisplay {
-    private final DisplayInfo mBaseDisplayInfo = new DisplayInfo();
+    private static final String TAG = "LogicalDisplay";
 
     // The layer stack we use when the display has been blanked to prevent any
     // of its content from appearing.
     private static final int BLANK_LAYER_STACK = -1;
 
+    private static final DisplayInfo EMPTY_DISPLAY_INFO = new DisplayInfo();
+
+    private final DisplayInfo mBaseDisplayInfo = new DisplayInfo();
     private final int mDisplayId;
     private final int mLayerStack;
+
+    private int mDisplayGroupId = Display.INVALID_DISPLAY_GROUP;
+
     /**
      * Override information set by the window manager. Will be reported instead of {@link #mInfo}
      * if not null.
@@ -91,6 +104,8 @@ final class LogicalDisplay {
     private int mRequestedColorMode;
     private boolean mRequestedMinimalPostProcessing;
 
+    private int[] mUserDisabledHdrTypes = {};
+
     private DisplayModeDirector.DesiredDisplayModeSpecs mDesiredDisplayModeSpecs =
             new DisplayModeDirector.DesiredDisplayModeSpecs();
 
@@ -115,10 +130,37 @@ final class LogicalDisplay {
     private final Rect mTempLayerStackRect = new Rect();
     private final Rect mTempDisplayRect = new Rect();
 
+    /**
+     * The UID mappings for refresh rate override
+     */
+    private DisplayEventReceiver.FrameRateOverride[] mFrameRateOverrides;
+
+    /**
+     * Holds a set of UIDs that their frame rate override changed and needs to be notified
+     */
+    private ArraySet<Integer> mPendingFrameRateOverrideUids;
+
+    /**
+     * Temporary frame rate override list, used when needed.
+     */
+    private final SparseArray<Float> mTempFrameRateOverride;
+
+    // Indicates the display is enabled (allowed to be ON).
+    private boolean mIsEnabled;
+
+    // Indicates the display is part of a transition from one device-state ({@link
+    // DeviceStateManager}) to another. Being a "part" of a transition means that either
+    // the {@link mIsEnabled} is changing, or the underlying mPrimiaryDisplayDevice is changing.
+    private boolean mIsInTransition;
+
     public LogicalDisplay(int displayId, int layerStack, DisplayDevice primaryDisplayDevice) {
         mDisplayId = displayId;
         mLayerStack = layerStack;
         mPrimaryDisplayDevice = primaryDisplayDevice;
+        mPendingFrameRateOverrideUids = new ArraySet<>();
+        mTempFrameRateOverride = new SparseArray<>();
+        mIsEnabled = true;
+        mIsInTransition = false;
     }
 
     /**
@@ -159,15 +201,37 @@ final class LogicalDisplay {
                 info.largestNominalAppHeight = mOverrideDisplayInfo.largestNominalAppHeight;
                 info.logicalWidth = mOverrideDisplayInfo.logicalWidth;
                 info.logicalHeight = mOverrideDisplayInfo.logicalHeight;
+                info.physicalXDpi = mOverrideDisplayInfo.physicalXDpi;
+                info.physicalYDpi = mOverrideDisplayInfo.physicalYDpi;
                 info.rotation = mOverrideDisplayInfo.rotation;
                 info.displayCutout = mOverrideDisplayInfo.displayCutout;
                 info.logicalDensityDpi = mOverrideDisplayInfo.logicalDensityDpi;
-                info.physicalXDpi = mOverrideDisplayInfo.physicalXDpi;
-                info.physicalYDpi = mOverrideDisplayInfo.physicalYDpi;
+                info.roundedCorners = mOverrideDisplayInfo.roundedCorners;
             }
             mInfo.set(info);
         }
         return mInfo.get();
+    }
+
+    /**
+     * Returns the frame rate overrides list
+     */
+    public DisplayEventReceiver.FrameRateOverride[] getFrameRateOverrides() {
+        return mFrameRateOverrides;
+    }
+
+    /**
+     * Returns the list of uids that needs to be updated about their frame rate override
+     */
+    public ArraySet<Integer> getPendingFrameRateOverrideUids() {
+        return mPendingFrameRateOverrideUids;
+    }
+
+    /**
+     * Clears the list of uids that needs to be updated about their frame rate override
+     */
+    public void clearPendingFrameRateOverrideUids() {
+        mPendingFrameRateOverrideUids = new ArraySet<>();
     }
 
     /**
@@ -216,21 +280,34 @@ final class LogicalDisplay {
     }
 
     /**
+     * Updates the {@link DisplayGroup} to which the logical display belongs.
+     *
+     * @param groupId Identifier for the {@link DisplayGroup}.
+     */
+    public void updateDisplayGroupIdLocked(int groupId) {
+        if (groupId != mDisplayGroupId) {
+            mDisplayGroupId = groupId;
+            mBaseDisplayInfo.displayGroupId = groupId;
+            mInfo.set(null);
+        }
+    }
+
+    /**
      * Updates the state of the logical display based on the available display devices.
      * The logical display might become invalid if it is attached to a display device
      * that no longer exists.
      *
-     * @param devices The list of all connected display devices.
+     * @param deviceRepo Repository of active {@link DisplayDevice}s.
      */
-    public void updateLocked(List<DisplayDevice> devices) {
+    public void updateLocked(DisplayDeviceRepository deviceRepo) {
         // Nothing to update if already invalid.
         if (mPrimaryDisplayDevice == null) {
             return;
         }
 
         // Check whether logical display has become invalid.
-        if (!devices.contains(mPrimaryDisplayDevice)) {
-            mPrimaryDisplayDevice = null;
+        if (!deviceRepo.containsLocked(mPrimaryDisplayDevice)) {
+            setPrimaryDisplayDeviceLocked(null);
             return;
         }
 
@@ -272,6 +349,15 @@ final class LogicalDisplay {
             if ((deviceInfo.flags & DisplayDeviceInfo.FLAG_TRUSTED) != 0) {
                 mBaseDisplayInfo.flags |= Display.FLAG_TRUSTED;
             }
+            if ((deviceInfo.flags & DisplayDeviceInfo.FLAG_OWN_DISPLAY_GROUP) != 0) {
+                mBaseDisplayInfo.flags |= Display.FLAG_OWN_DISPLAY_GROUP;
+            }
+            if ((deviceInfo.flags & DisplayDeviceInfo.FLAG_ALWAYS_UNLOCKED) != 0) {
+                mBaseDisplayInfo.flags |= Display.FLAG_ALWAYS_UNLOCKED;
+            }
+            if ((deviceInfo.flags & DisplayDeviceInfo.FLAG_TOUCH_FEEDBACK_DISABLED) != 0) {
+                mBaseDisplayInfo.flags |= Display.FLAG_TOUCH_FEEDBACK_DISABLED;
+            }
             Rect maskingInsets = getMaskingInsets(deviceInfo);
             int maskedWidth = deviceInfo.width - maskingInsets.left - maskingInsets.right;
             int maskedHeight = deviceInfo.height - maskingInsets.top - maskingInsets.bottom;
@@ -295,6 +381,7 @@ final class LogicalDisplay {
                     deviceInfo.supportedColorModes,
                     deviceInfo.supportedColorModes.length);
             mBaseDisplayInfo.hdrCapabilities = deviceInfo.hdrCapabilities;
+            mBaseDisplayInfo.userDisabledHdrTypes = mUserDisabledHdrTypes;
             mBaseDisplayInfo.minimalPostProcessingSupported =
                     deviceInfo.allmSupported || deviceInfo.gameContentTypeSupported;
             mBaseDisplayInfo.logicalDensityDpi = deviceInfo.densityDpi;
@@ -313,9 +400,42 @@ final class LogicalDisplay {
                     (deviceInfo.flags & DisplayDeviceInfo.FLAG_MASK_DISPLAY_CUTOUT) != 0;
             mBaseDisplayInfo.displayCutout = maskCutout ? null : deviceInfo.displayCutout;
             mBaseDisplayInfo.displayId = mDisplayId;
-
+            mBaseDisplayInfo.displayGroupId = mDisplayGroupId;
+            updateFrameRateOverrides(deviceInfo);
+            mBaseDisplayInfo.brightnessMinimum = deviceInfo.brightnessMinimum;
+            mBaseDisplayInfo.brightnessMaximum = deviceInfo.brightnessMaximum;
+            mBaseDisplayInfo.brightnessDefault = deviceInfo.brightnessDefault;
+            mBaseDisplayInfo.roundedCorners = deviceInfo.roundedCorners;
+            mBaseDisplayInfo.installOrientation = deviceInfo.installOrientation;
             mPrimaryDisplayDeviceInfo = deviceInfo;
             mInfo.set(null);
+        }
+    }
+
+    private void updateFrameRateOverrides(DisplayDeviceInfo deviceInfo) {
+        mTempFrameRateOverride.clear();
+        if (mFrameRateOverrides != null) {
+            for (DisplayEventReceiver.FrameRateOverride frameRateOverride
+                    : mFrameRateOverrides) {
+                mTempFrameRateOverride.put(frameRateOverride.uid,
+                        frameRateOverride.frameRateHz);
+            }
+        }
+        mFrameRateOverrides = deviceInfo.frameRateOverrides;
+        if (mFrameRateOverrides != null) {
+            for (DisplayEventReceiver.FrameRateOverride frameRateOverride
+                    : mFrameRateOverrides) {
+                float refreshRate = mTempFrameRateOverride.get(frameRateOverride.uid, 0f);
+                if (refreshRate == 0 || frameRateOverride.frameRateHz != refreshRate) {
+                    mTempFrameRateOverride.put(frameRateOverride.uid,
+                            frameRateOverride.frameRateHz);
+                } else {
+                    mTempFrameRateOverride.delete(frameRateOverride.uid);
+                }
+            }
+        }
+        for (int i = 0; i < mTempFrameRateOverride.size(); i++) {
+            mPendingFrameRateOverrideUids.add(mTempFrameRateOverride.keyAt(i));
         }
     }
 
@@ -375,6 +495,13 @@ final class LogicalDisplay {
             boolean isBlanked) {
         // Set the layer stack.
         device.setLayerStackLocked(t, isBlanked ? BLANK_LAYER_STACK : mLayerStack);
+        // Also inform whether the device is the same one sent to inputflinger for its layerstack.
+        // Prevent displays that are disabled from receiving input.
+        // TODO(b/188914255): Remove once input can dispatch against device vs layerstack.
+        device.setDisplayFlagsLocked(t,
+                (isEnabledLocked() && device.getDisplayDeviceInfoLocked().touch != TOUCH_NONE)
+                        ? SurfaceControl.DISPLAY_RECEIVES_INPUT
+                        : 0);
 
         // Set the color mode and allowed display mode.
         if (device == mPrimaryDisplayDevice) {
@@ -576,8 +703,83 @@ final class LogicalDisplay {
         mDisplayScalingDisabled = disableScaling;
     }
 
+    public void setUserDisabledHdrTypes(@NonNull int[] userDisabledHdrTypes) {
+        if (mUserDisabledHdrTypes != userDisabledHdrTypes) {
+            mUserDisabledHdrTypes = userDisabledHdrTypes;
+            mBaseDisplayInfo.userDisabledHdrTypes = userDisabledHdrTypes;
+            mInfo.set(null);
+        }
+    }
+
+    /**
+     * Swap the underlying {@link DisplayDevice} with the specified LogicalDisplay.
+     *
+     * @param targetDisplay The display with which to swap display-devices.
+     * @return {@code true} if the displays were swapped, {@code false} otherwise.
+     */
+    public void swapDisplaysLocked(@NonNull LogicalDisplay targetDisplay) {
+        final DisplayDevice oldTargetDevice =
+                targetDisplay.setPrimaryDisplayDeviceLocked(mPrimaryDisplayDevice);
+        setPrimaryDisplayDeviceLocked(oldTargetDevice);
+    }
+
+    /**
+     * Sets the primary display device to the specified device.
+     *
+     * @param device The new device to set.
+     * @return The previously set display device.
+     */
+    public DisplayDevice setPrimaryDisplayDeviceLocked(@Nullable DisplayDevice device) {
+        final DisplayDevice old = mPrimaryDisplayDevice;
+        mPrimaryDisplayDevice = device;
+
+        // Reset all our display info data
+        mPrimaryDisplayDeviceInfo = null;
+        mBaseDisplayInfo.copyFrom(EMPTY_DISPLAY_INFO);
+        mInfo.set(null);
+
+        return old;
+    }
+
+    /**
+     * @return {@code true} if the LogicalDisplay is enabled or {@code false}
+     * if disabled indicating that the display should be hidden from the rest of the apps and
+     * framework.
+     */
+    public boolean isEnabledLocked() {
+        return mIsEnabled;
+    }
+
+    /**
+     * Sets the display as enabled.
+     *
+     * @param enable True if enabled, false otherwise.
+     */
+    public void setEnabledLocked(boolean enabled) {
+        mIsEnabled = enabled;
+    }
+
+    /**
+     * @return {@code true} if the LogicalDisplay is in a transition phase. This is used to indicate
+     * that we are getting ready to swap the underlying display-device and the display should be
+     * rendered appropriately to reduce jank.
+     */
+    public boolean isInTransitionLocked() {
+        return mIsInTransition;
+    }
+
+    /**
+     * Sets the transition phase.
+     * @param isInTransition True if it display is in transition.
+     */
+    public void setIsInTransitionLocked(boolean isInTransition) {
+        mIsInTransition = isInTransition;
+    }
+
     public void dumpLocked(PrintWriter pw) {
         pw.println("mDisplayId=" + mDisplayId);
+        pw.println("mIsEnabled=" + mIsEnabled);
+        pw.println("mIsInTransition=" + mIsInTransition);
         pw.println("mLayerStack=" + mLayerStack);
         pw.println("mHasContent=" + mHasContent);
         pw.println("mDesiredDisplayModeSpecs={" + mDesiredDisplayModeSpecs + "}");
@@ -589,5 +791,14 @@ final class LogicalDisplay {
         pw.println("mBaseDisplayInfo=" + mBaseDisplayInfo);
         pw.println("mOverrideDisplayInfo=" + mOverrideDisplayInfo);
         pw.println("mRequestedMinimalPostProcessing=" + mRequestedMinimalPostProcessing);
+        pw.println("mFrameRateOverrides=" + Arrays.toString(mFrameRateOverrides));
+        pw.println("mPendingFrameRateOverrideUids=" + mPendingFrameRateOverrideUids);
+    }
+
+    @Override
+    public String toString() {
+        StringWriter sw = new StringWriter();
+        dumpLocked(new PrintWriter(sw));
+        return sw.toString();
     }
 }

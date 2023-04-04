@@ -26,7 +26,8 @@ import android.telephony.ims.RcsContactUceCapability;
 import android.telephony.ims.stub.CapabilityExchangeEventListener;
 import android.util.Log;
 
-import java.util.List;
+import java.util.ArrayList;
+import java.util.Set;
 
 /**
  * The ICapabilityExchangeEventListener wrapper class to store the listener which is registered by
@@ -80,11 +81,31 @@ public class CapabilityExchangeAidlWrapper implements CapabilityExchangeEventLis
     }
 
     /**
+     * Receives the status of changes in the publishing connection from ims service
+     * and deliver this callback to the framework.
+     */
+    public void onPublishUpdated(int reasonCode, @NonNull String reasonPhrase,
+            int reasonHeaderCause, @NonNull String reasonHeaderText) throws ImsException {
+        ICapabilityExchangeEventListener listener = mListenerBinder;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.onPublishUpdated(reasonCode, reasonPhrase,
+                    reasonHeaderCause, reasonHeaderText);
+        } catch (RemoteException e) {
+            Log.w(LOG_TAG, "onPublishUpdated exception: " + e);
+            throw new ImsException("Remote is not available",
+                    ImsException.CODE_ERROR_SERVICE_UNAVAILABLE);
+        }
+    }
+
+    /**
      * Receives the callback of the remote capability request from the network and deliver this
      * request to the framework.
      */
     public void onRemoteCapabilityRequest(@NonNull Uri contactUri,
-            @NonNull List<String> remoteCapabilities, @NonNull OptionsRequestCallback callback)
+            @NonNull Set<String> remoteCapabilities, @NonNull OptionsRequestCallback callback)
             throws ImsException {
         ICapabilityExchangeEventListener listener = mListenerBinder;
         if (listener == null) {
@@ -114,7 +135,8 @@ public class CapabilityExchangeAidlWrapper implements CapabilityExchangeEventLis
         };
 
         try {
-            listener.onRemoteCapabilityRequest(contactUri, remoteCapabilities, internalCallback);
+            listener.onRemoteCapabilityRequest(contactUri, new ArrayList<>(remoteCapabilities),
+                    internalCallback);
         } catch (RemoteException e) {
             Log.w(LOG_TAG, "Remote capability request exception: " + e);
             throw new ImsException("Remote is not available",

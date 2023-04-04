@@ -167,12 +167,17 @@ public class NetworkPolicyManager {
     public static final String FIREWALL_CHAIN_NAME_POWERSAVE = "powersave";
     /** @hide */
     public static final String FIREWALL_CHAIN_NAME_RESTRICTED = "restricted";
+    /** @hide */
+    public static final String FIREWALL_CHAIN_NAME_LOW_POWER_STANDBY = "low_power_standby";
 
     private static final boolean ALLOW_PLATFORM_APP_POLICY = true;
 
     /** @hide */
     public static final int FOREGROUND_THRESHOLD_STATE =
             ActivityManager.PROCESS_STATE_BOUND_FOREGROUND_SERVICE;
+
+    /** @hide */
+    public static final int TOP_THRESHOLD_STATE = ActivityManager.PROCESS_STATE_BOUND_TOP;
 
     /**
      * {@link Intent} extra that indicates which {@link NetworkTemplate} rule it
@@ -202,81 +207,6 @@ public class NetworkPolicyManager {
         SUBSCRIPTION_OVERRIDE_CONGESTED
     })
     public @interface SubscriptionOverrideMask {}
-
-    /**
-     * Flag to indicate that an app is not subject to any restrictions that could result in its
-     * network access blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_REASON_NONE = 0;
-
-    /**
-     * Flag to indicate that an app is subject to Battery saver restrictions that would
-     * result in its network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_REASON_BATTERY_SAVER = 1 << 0;
-
-    /**
-     * Flag to indicate that an app is subject to Doze restrictions that would
-     * result in its network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_REASON_DOZE = 1 << 1;
-
-    /**
-     * Flag to indicate that an app is subject to App Standby restrictions that would
-     * result in its network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_REASON_APP_STANDBY = 1 << 2;
-
-    /**
-     * Flag to indicate that an app is subject to Restricted mode restrictions that would
-     * result in its network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_REASON_RESTRICTED_MODE = 1 << 3;
-
-    /**
-     * Flag to indicate that an app is subject to Data saver restrictions that would
-     * result in its metered network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_METERED_REASON_DATA_SAVER = 1 << 16;
-
-    /**
-     * Flag to indicate that an app is subject to user restrictions that would
-     * result in its metered network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_METERED_REASON_USER_RESTRICTED = 1 << 17;
-
-    /**
-     * Flag to indicate that an app is subject to Device admin restrictions that would
-     * result in its metered network access being blocked.
-     *
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static final int BLOCKED_METERED_REASON_ADMIN_DISABLED = 1 << 18;
-
-    /** @hide */
-    public static final int BLOCKED_METERED_REASON_MASK = 0xffff0000;
 
     /**
      * Flag to indicate that app is not exempt from any network restrictions.
@@ -320,31 +250,43 @@ public class NetworkPolicyManager {
      */
     public static final int ALLOWED_REASON_RESTRICTED_MODE_PERMISSIONS = 1 << 4;
     /**
+     * Flag to indicate that app is exempt from certain network restrictions because of it being
+     * in the bound top or top procstate.
+     *
+     * @hide
+     */
+    public static final int ALLOWED_REASON_TOP = 1 << 5;
+    /**
+     * Flag to indicate that app is exempt from low power standby restrictions because of it being
+     * allowlisted.
+     *
+     * @hide
+     */
+    public static final int ALLOWED_REASON_LOW_POWER_STANDBY_ALLOWLIST = 1 << 6;
+    /**
      * Flag to indicate that app is exempt from certain metered network restrictions because user
      * explicitly exempted it.
      *
      * @hide
      */
     public static final int ALLOWED_METERED_REASON_USER_EXEMPTED = 1 << 16;
+    /**
+     * Flag to indicate that app is exempt from certain metered network restrictions because of it
+     * being a system component.
+     *
+     * @hide
+     */
+    public static final int ALLOWED_METERED_REASON_SYSTEM = 1 << 17;
+    /**
+     * Flag to indicate that app is exempt from certain metered network restrictions because of it
+     * being in the foreground.
+     *
+     * @hide
+     */
+    public static final int ALLOWED_METERED_REASON_FOREGROUND = 1 << 18;
 
     /** @hide */
     public static final int ALLOWED_METERED_REASON_MASK = 0xffff0000;
-
-    /**
-     * @hide
-     */
-    @Retention(RetentionPolicy.SOURCE)
-    @IntDef(flag = true, prefix = {"BLOCKED_"}, value = {
-            BLOCKED_REASON_NONE,
-            BLOCKED_REASON_BATTERY_SAVER,
-            BLOCKED_REASON_DOZE,
-            BLOCKED_REASON_APP_STANDBY,
-            BLOCKED_REASON_RESTRICTED_MODE,
-            BLOCKED_METERED_REASON_DATA_SAVER,
-            BLOCKED_METERED_REASON_USER_RESTRICTED,
-            BLOCKED_METERED_REASON_ADMIN_DISABLED,
-    })
-    public @interface BlockedReason {}
 
     private final Context mContext;
     @UnsupportedAppUsage
@@ -529,6 +471,26 @@ public class NetworkPolicyManager {
     }
 
     /**
+     * Determines if an UID is subject to metered network restrictions while running in background.
+     *
+     * @param uid The UID whose status needs to be checked.
+     * @return {@link ConnectivityManager#RESTRICT_BACKGROUND_STATUS_DISABLED},
+     *         {@link ConnectivityManager##RESTRICT_BACKGROUND_STATUS_ENABLED},
+     *         or {@link ConnectivityManager##RESTRICT_BACKGROUND_STATUS_WHITELISTED} to denote
+     *         the current status of the UID.
+     * @hide
+     */
+    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
+    @RequiresPermission(NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK)
+    public int getRestrictBackgroundStatus(int uid) {
+        try {
+            return mService.getRestrictBackgroundStatus(uid);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
      * Override connections to be temporarily marked as either unmetered or congested,
      * along with automatic timeouts if desired.
      *
@@ -536,10 +498,11 @@ public class NetworkPolicyManager {
      * @param overrideMask the bitmask that specifies which of the overrides is being
      *            set or cleared.
      * @param overrideValue the override values to set or clear.
-     * @param networkTypes the network types this override applies to.
+     * @param networkTypes the network types this override applies to. If no
+     *            network types are specified, override values will be ignored.
      *            {@see TelephonyManager#getAllNetworkTypes()}
-     * @param timeoutMillis the timeout after which the requested override will
-     *            be automatically cleared, or {@code 0} to leave in the
+     * @param expirationDurationMillis the duration after which the requested override
+     *            will be automatically cleared, or {@code 0} to leave in the
      *            requested state until explicitly cleared, or the next reboot,
      *            whichever happens first
      * @param callingPackage the name of the package making the call.
@@ -547,11 +510,11 @@ public class NetworkPolicyManager {
      */
     public void setSubscriptionOverride(int subId, @SubscriptionOverrideMask int overrideMask,
             @SubscriptionOverrideMask int overrideValue,
-            @NonNull @Annotation.NetworkType int[] networkTypes, long timeoutMillis,
+            @NonNull @Annotation.NetworkType int[] networkTypes, long expirationDurationMillis,
             @NonNull String callingPackage) {
         try {
             mService.setSubscriptionOverride(subId, overrideMask, overrideValue, networkTypes,
-                    timeoutMillis, callingPackage);
+                    expirationDurationMillis, callingPackage);
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -562,13 +525,16 @@ public class NetworkPolicyManager {
      *
      * @param subId the subscriber this relationship applies to.
      * @param plans the list of plans.
+     * @param expirationDurationMillis the duration after which the subscription plans
+     *            will be automatically cleared, or {@code 0} to leave the plans until
+     *            explicitly cleared, or the next reboot, whichever happens first
      * @param callingPackage the name of the package making the call
      * @hide
      */
     public void setSubscriptionPlans(int subId, @NonNull SubscriptionPlan[] plans,
-            @NonNull String callingPackage) {
+            long expirationDurationMillis, @NonNull String callingPackage) {
         try {
-            mService.setSubscriptionPlans(subId, plans, callingPackage);
+            mService.setSubscriptionPlans(subId, plans, expirationDurationMillis, callingPackage);
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -579,12 +545,72 @@ public class NetworkPolicyManager {
      *
      * @param subId the subscriber to get the subscription plans for.
      * @param callingPackage the name of the package making the call.
+     * @return the active {@link SubscriptionPlan}s for the given subscription id, or
+     *         {@code null} if not found.
      * @hide
      */
-    @NonNull
+    @Nullable
     public SubscriptionPlan[] getSubscriptionPlans(int subId, @NonNull String callingPackage) {
         try {
             return mService.getSubscriptionPlans(subId, callingPackage);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Get subscription plan for the given networkTemplate.
+     *
+     * @param template the networkTemplate to get the subscription plan for.
+     * @return the active {@link SubscriptionPlan}s for the given template, or
+     *         {@code null} if not found.
+     * @hide
+     */
+    @Nullable
+    @RequiresPermission(anyOf = {
+            NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK,
+            android.Manifest.permission.NETWORK_STACK})
+    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
+    public SubscriptionPlan getSubscriptionPlan(@NonNull NetworkTemplate template) {
+        try {
+            return mService.getSubscriptionPlan(template);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notifies that the specified {@link NetworkStatsProvider} has reached its warning threshold
+     * which was set through {@link NetworkStatsProvider#onSetWarningAndLimit(String, long, long)}.
+     *
+     * @hide
+     */
+    @RequiresPermission(anyOf = {
+            NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK,
+            android.Manifest.permission.NETWORK_STACK})
+    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
+    public void notifyStatsProviderWarningReached() {
+        try {
+            mService.notifyStatsProviderWarningOrLimitReached();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notifies that the specified {@link NetworkStatsProvider} has reached its quota
+     * which was set through {@link NetworkStatsProvider#onSetLimit(String, long)} or
+     * {@link NetworkStatsProvider#onSetWarningAndLimit(String, long, long)}.
+     *
+     * @hide
+     */
+    @RequiresPermission(anyOf = {
+            NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK,
+            android.Manifest.permission.NETWORK_STACK})
+    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
+    public void notifyStatsProviderLimitReached() {
+        try {
+            mService.notifyStatsProviderWarningOrLimitReached();
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -610,37 +636,11 @@ public class NetworkPolicyManager {
      * @param meteredNetwork True if the network is metered.
      * @return true if networking is blocked for the given uid according to current networking
      *         policies.
-     *
-     * @hide
      */
+    @RequiresPermission(android.Manifest.permission.OBSERVE_NETWORK_POLICY)
     public boolean isUidNetworkingBlocked(int uid, boolean meteredNetwork) {
         try {
             return mService.isUidNetworkingBlocked(uid, meteredNetwork);
-        } catch (RemoteException e) {
-            throw e.rethrowFromSystemServer();
-        }
-    }
-
-    /**
-     * Figure out if networking is blocked for a given set of conditions.
-     *
-     * This is used by ConnectivityService via passing stale copies of conditions, so it must not
-     * take any locks.
-     *
-     * @param uid The target uid.
-     * @param uidRules The uid rules which are obtained from NetworkPolicyManagerService.
-     * @param isNetworkMetered True if the network is metered.
-     * @param isBackgroundRestricted True if data saver is enabled.
-     *
-     * @return true if networking is blocked for the UID under the specified conditions.
-     *
-     * @hide
-     */
-    public boolean checkUidNetworkingBlocked(int uid, int uidRules,
-            boolean isNetworkMetered, boolean isBackgroundRestricted) {
-        try {
-            return mService.checkUidNetworkingBlocked(uid, uidRules, isNetworkMetered,
-                    isBackgroundRestricted);
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -651,9 +651,8 @@ public class NetworkPolicyManager {
      *
      * @param uid The target uid.
      * @return true if the given uid is restricted from doing networking on metered networks.
-     *
-     * @hide
      */
+    @RequiresPermission(android.Manifest.permission.OBSERVE_NETWORK_POLICY)
     public boolean isUidRestrictedOnMeteredNetworks(int uid) {
         try {
             return mService.isUidRestrictedOnMeteredNetworks(uid);
@@ -663,11 +662,15 @@ public class NetworkPolicyManager {
     }
 
     /**
-     * Get multipath preference for the given network.
+     * Gets a hint on whether it is desirable to use multipath data transfer on the given network.
+     *
+     * @return One of the ConnectivityManager.MULTIPATH_PREFERENCE_* constants.
      *
      * @hide
      */
-    public int getMultipathPreference(Network network) {
+    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
+    @RequiresPermission(NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK)
+    public int getMultipathPreference(@NonNull Network network) {
         try {
             return mService.getMultipathPreference(network);
         } catch (RemoteException e) {
@@ -784,6 +787,14 @@ public class NetworkPolicyManager {
                 || (capability & ActivityManager.PROCESS_CAPABILITY_NETWORK) != 0;
     }
 
+    /** @hide */
+    public static boolean isProcStateAllowedWhileInLowPowerStandby(@Nullable UidState uidState) {
+        if (uidState == null) {
+            return false;
+        }
+        return uidState.procState <= TOP_THRESHOLD_STATE;
+    }
+
     /**
      * Returns true if {@param procState} is considered foreground and as such will be allowed
      * to access network when the device is in data saver mode. Otherwise, false.
@@ -806,11 +817,13 @@ public class NetworkPolicyManager {
     public static final class UidState {
         public int uid;
         public int procState;
+        public long procStateSeq;
         public int capability;
 
-        public UidState(int uid, int procState, int capability) {
+        public UidState(int uid, int procState, long procStateSeq, int capability) {
             this.uid = uid;
             this.procState = procState;
+            this.procStateSeq = procStateSeq;
             this.capability = capability;
         }
 
@@ -819,6 +832,8 @@ public class NetworkPolicyManager {
             final StringBuilder sb = new StringBuilder();
             sb.append("{procState=");
             sb.append(procStateToString(procState));
+            sb.append(",seq=");
+            sb.append(procStateSeq);
             sb.append(",cap=");
             ActivityManager.printCapabilitiesSummary(sb, capability);
             sb.append("}");
@@ -840,45 +855,21 @@ public class NetworkPolicyManager {
     }
 
     /**
-     * Returns whether network access of an UID is blocked or not based on {@code blockedReasons}
-     * corresponding to it.
-     *
-     * {@code blockedReasons} would be a bitwise {@code OR} combination of the
-     * {@code BLOCKED_REASON_*} and/or {@code BLOCKED_METERED_REASON_*} constants.
-     *
-     * @param blockedReasons Value indicating the reasons for why the network access of an UID is
-     *                       blocked. If the value is equal to {@link #BLOCKED_REASON_NONE}, then
-     *                       it indicates that an app's network access is not blocked.
-     * @param meteredNetwork Value indicating whether the network is metered or not.
-     * @return Whether network access is blocked or not.
-     * @hide
-     */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-    public static boolean isUidBlocked(@BlockedReason int blockedReasons, boolean meteredNetwork) {
-        if (blockedReasons == BLOCKED_REASON_NONE) {
-            return false;
-        }
-        final int blockedOnAllNetworksReason = (blockedReasons & ~BLOCKED_METERED_REASON_MASK);
-        if (blockedOnAllNetworksReason != BLOCKED_REASON_NONE) {
-            return true;
-        }
-        if (meteredNetwork) {
-            return blockedReasons != BLOCKED_REASON_NONE;
-        }
-        return false;
-    }
-
-    /**
      * Returns the {@code string} representation of {@code blockedReasons} argument.
      *
      * @param blockedReasons Value indicating the reasons for why the network access of an UID is
      *                       blocked.
      * @hide
      */
-    @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
     @NonNull
-    public static String blockedReasonsToString(@BlockedReason int blockedReasons) {
-        return DebugUtils.flagsToString(NetworkPolicyManager.class, "BLOCKED_", blockedReasons);
+    public static String blockedReasonsToString(int blockedReasons) {
+        return DebugUtils.flagsToString(ConnectivityManager.class, "BLOCKED_", blockedReasons);
+    }
+
+    /** @hide */
+    @NonNull
+    public static String allowedReasonsToString(int allowedReasons) {
+        return DebugUtils.flagsToString(NetworkPolicyManager.class, "ALLOWED_", allowedReasons);
     }
 
     /**
@@ -941,7 +932,7 @@ public class NetworkPolicyManager {
          * @hide
          */
         @SystemApi(client = SystemApi.Client.MODULE_LIBRARIES)
-        default void onUidBlockedReasonChanged(int uid, @BlockedReason int blockedReasons) {}
+        default void onUidBlockedReasonChanged(int uid, int blockedReasons) {}
     }
 
     /** @hide */
@@ -956,8 +947,7 @@ public class NetworkPolicyManager {
         }
 
         @Override
-        public void onBlockedReasonChanged(int uid, @BlockedReason int oldBlockedReasons,
-                @BlockedReason int newBlockedReasons) {
+        public void onBlockedReasonChanged(int uid, int oldBlockedReasons, int newBlockedReasons) {
             if (oldBlockedReasons != newBlockedReasons) {
                 dispatchOnUidBlockedReasonChanged(mExecutor, mCallback, uid, newBlockedReasons);
             }
@@ -965,7 +955,7 @@ public class NetworkPolicyManager {
     }
 
     private static void dispatchOnUidBlockedReasonChanged(@Nullable Executor executor,
-            @NonNull NetworkPolicyCallback callback, int uid, @BlockedReason int blockedReasons) {
+            @NonNull NetworkPolicyCallback callback, int uid, int blockedReasons) {
         if (executor == null) {
             callback.onUidBlockedReasonChanged(uid, blockedReasons);
         } else {

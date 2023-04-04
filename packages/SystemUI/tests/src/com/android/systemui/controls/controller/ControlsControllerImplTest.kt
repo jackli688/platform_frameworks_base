@@ -17,14 +17,12 @@
 package com.android.systemui.controls.controller
 
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.UserHandle
-import android.provider.Settings
 import android.service.controls.Control
 import android.service.controls.DeviceTypes
 import android.service.controls.actions.ControlAction
@@ -32,14 +30,19 @@ import android.testing.AndroidTestingRunner
 import androidx.test.filters.SmallTest
 import com.android.systemui.SysuiTestCase
 import com.android.systemui.backup.BackupHelper
-import com.android.systemui.broadcast.BroadcastDispatcher
 import com.android.systemui.controls.ControlStatus
 import com.android.systemui.controls.ControlsServiceInfo
 import com.android.systemui.controls.management.ControlsListingController
 import com.android.systemui.controls.ui.ControlsUiController
 import com.android.systemui.dump.DumpManager
+import com.android.systemui.settings.UserFileManager
+import com.android.systemui.settings.UserTracker
 import com.android.systemui.util.concurrency.FakeExecutor
 import com.android.systemui.util.time.FakeSystemClock
+import com.google.common.truth.Truth.assertThat
+import java.io.File
+import java.util.Optional
+import java.util.function.Consumer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -50,19 +53,20 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers
+import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Captor
 import org.mockito.Mock
 import org.mockito.Mockito
-import org.mockito.Mockito.`when`
+import org.mockito.Mockito.anyInt
 import org.mockito.Mockito.inOrder
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.never
 import org.mockito.Mockito.reset
+import org.mockito.Mockito.times
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.verifyNoMoreInteractions
+import org.mockito.Mockito.`when`
 import org.mockito.MockitoAnnotations
-import java.util.Optional
-import java.util.function.Consumer
 
 @SmallTest
 @RunWith(AndroidTestingRunner::class)
@@ -79,9 +83,11 @@ class ControlsControllerImplTest : SysuiTestCase() {
     @Mock
     private lateinit var auxiliaryPersistenceWrapper: AuxiliaryPersistenceWrapper
     @Mock
-    private lateinit var broadcastDispatcher: BroadcastDispatcher
-    @Mock
     private lateinit var listingController: ControlsListingController
+    @Mock
+    private lateinit var userTracker: UserTracker
+    @Mock
+    private lateinit var userFileManager: UserFileManager
 
     @Captor
     private lateinit var structureInfoCaptor: ArgumentCaptor<StructureInfo>
@@ -94,7 +100,7 @@ class ControlsControllerImplTest : SysuiTestCase() {
             ArgumentCaptor<ControlsBindingController.LoadCallback>
 
     @Captor
-    private lateinit var broadcastReceiverCaptor: ArgumentCaptor<BroadcastReceiver>
+    private lateinit var userTrackerCallbackCaptor: ArgumentCaptor<UserTracker.Callback>
     @Captor
     private lateinit var listingCallbackCaptor:
             ArgumentCaptor<ControlsListingController.ControlsListingCallback>
@@ -138,10 +144,7 @@ class ControlsControllerImplTest : SysuiTestCase() {
     fun setUp() {
         MockitoAnnotations.initMocks(this)
 
-        Settings.Secure.putInt(mContext.contentResolver,
-                ControlsControllerImpl.CONTROLS_AVAILABLE, 1)
-        Settings.Secure.putIntForUser(mContext.contentResolver,
-                ControlsControllerImpl.CONTROLS_AVAILABLE, 1, otherUser)
+        `when`(userTracker.userHandle).thenReturn(UserHandle.of(user))
 
         delayableExecutor = FakeExecutor(FakeSystemClock())
 
@@ -153,6 +156,9 @@ class ControlsControllerImplTest : SysuiTestCase() {
 
         canceller = DidRunRunnable()
         `when`(bindingController.bindAndLoad(any(), any())).thenReturn(canceller)
+        `when`(userFileManager.getFile(anyString(), anyInt())).thenReturn(mock(File::class.java))
+        `when`(userFileManager.getSharedPreferences(anyString(), anyInt(), anyInt()))
+            .thenReturn(context.getSharedPreferences("test", Context.MODE_PRIVATE))
 
         controller = ControlsControllerImpl(
                 wrapper,
@@ -160,15 +166,16 @@ class ControlsControllerImplTest : SysuiTestCase() {
                 uiController,
                 bindingController,
                 listingController,
-                broadcastDispatcher,
+                userFileManager,
+                userTracker,
                 Optional.of(persistenceWrapper),
                 mock(DumpManager::class.java)
         )
         controller.auxiliaryPersistenceWrapper = auxiliaryPersistenceWrapper
 
-        assertTrue(controller.available)
-        verify(broadcastDispatcher).registerReceiver(
-                capture(broadcastReceiverCaptor), any(), any(), eq(UserHandle.ALL))
+        verify(userTracker).addCallback(
+            capture(userTrackerCallbackCaptor), any()
+        )
 
         verify(listingController).addCallback(capture(listingCallbackCaptor))
     }
@@ -215,7 +222,8 @@ class ControlsControllerImplTest : SysuiTestCase() {
                 uiController,
                 bindingController,
                 listingController,
-                broadcastDispatcher,
+                userFileManager,
+                userTracker,
                 Optional.of(persistenceWrapper),
                 mock(DumpManager::class.java)
         )
@@ -504,14 +512,8 @@ class ControlsControllerImplTest : SysuiTestCase() {
         delayableExecutor.runAllReady()
 
         reset(persistenceWrapper)
-        val intent = Intent(Intent.ACTION_USER_SWITCHED).apply {
-            putExtra(Intent.EXTRA_USER_HANDLE, otherUser)
-        }
-        val pendingResult = mock(BroadcastReceiver.PendingResult::class.java)
-        `when`(pendingResult.sendingUserId).thenReturn(otherUser)
-        broadcastReceiverCaptor.value.pendingResult = pendingResult
 
-        broadcastReceiverCaptor.value.onReceive(mContext, intent)
+        userTrackerCallbackCaptor.value.onUserChanged(otherUser, mContext)
 
         verify(persistenceWrapper).changeFileAndBackupManager(any(), any())
         verify(persistenceWrapper).readFavorites()
@@ -520,58 +522,6 @@ class ControlsControllerImplTest : SysuiTestCase() {
         verify(listingController).changeUser(UserHandle.of(otherUser))
         assertTrue(controller.getFavorites().isEmpty())
         assertEquals(otherUser, controller.currentUserId)
-        assertTrue(controller.available)
-    }
-
-    @Test
-    fun testDisableFeature_notAvailable() {
-        Settings.Secure.putIntForUser(mContext.contentResolver,
-                ControlsControllerImpl.CONTROLS_AVAILABLE, 0, user)
-        controller.settingObserver.onChange(false, listOf(ControlsControllerImpl.URI), 0, 0)
-        assertFalse(controller.available)
-    }
-
-    @Test
-    fun testDisableFeature_clearFavorites() {
-        controller.replaceFavoritesForStructure(TEST_STRUCTURE_INFO)
-        delayableExecutor.runAllReady()
-
-        assertFalse(controller.getFavorites().isEmpty())
-
-        Settings.Secure.putIntForUser(mContext.contentResolver,
-                ControlsControllerImpl.CONTROLS_AVAILABLE, 0, user)
-        controller.settingObserver.onChange(false, listOf(ControlsControllerImpl.URI), 0, user)
-        assertTrue(controller.getFavorites().isEmpty())
-    }
-
-    @Test
-    fun testDisableFeature_noChangeForNotCurrentUser() {
-        controller.replaceFavoritesForStructure(TEST_STRUCTURE_INFO)
-        delayableExecutor.runAllReady()
-
-        Settings.Secure.putIntForUser(mContext.contentResolver,
-                ControlsControllerImpl.CONTROLS_AVAILABLE, 0, otherUser)
-        controller.settingObserver.onChange(false, listOf(ControlsControllerImpl.URI), 0, otherUser)
-
-        assertTrue(controller.available)
-        assertFalse(controller.getFavorites().isEmpty())
-    }
-
-    @Test
-    fun testCorrectUserSettingOnUserChange() {
-        Settings.Secure.putIntForUser(mContext.contentResolver,
-                ControlsControllerImpl.CONTROLS_AVAILABLE, 0, otherUser)
-
-        val intent = Intent(Intent.ACTION_USER_SWITCHED).apply {
-            putExtra(Intent.EXTRA_USER_HANDLE, otherUser)
-        }
-        val pendingResult = mock(BroadcastReceiver.PendingResult::class.java)
-        `when`(pendingResult.sendingUserId).thenReturn(otherUser)
-        broadcastReceiverCaptor.value.pendingResult = pendingResult
-
-        broadcastReceiverCaptor.value.onReceive(mContext, intent)
-
-        assertFalse(controller.available)
     }
 
     @Test
@@ -960,6 +910,14 @@ class ControlsControllerImplTest : SysuiTestCase() {
         delayableExecutor.runAllReady()
 
         assertTrue(controller.getFavoritesForStructure(TEST_COMPONENT_2, TEST_STRUCTURE).isEmpty())
+    }
+
+    @Test
+    fun testUserStructure() {
+        val userStructure = UserStructure(context, context.user, userFileManager)
+        verify(userFileManager, times(2))
+            .getFile(ControlsFavoritePersistenceWrapper.FILE_NAME, context.user.identifier)
+        assertThat(userStructure.file).isNotNull()
     }
 }
 

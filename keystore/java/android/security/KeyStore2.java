@@ -18,8 +18,8 @@ package android.security;
 
 import android.annotation.NonNull;
 import android.compat.annotation.ChangeId;
-import android.compat.annotation.EnabledAfter;
-import android.os.Build;
+import android.compat.annotation.Disabled;
+import android.os.Binder;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.ServiceSpecificException;
@@ -86,7 +86,7 @@ public class KeyStore2 {
      * successfully conclude an operation.
      */
     @ChangeId
-    @EnabledAfter(targetSdkVersion = Build.VERSION_CODES.R)
+    @Disabled // See b/180133780
     static final long KEYSTORE_OPERATION_CREATION_MAY_FAIL = 169897160L;
 
     // Never use mBinder directly, use KeyStore2.getService() instead or better yet
@@ -108,7 +108,7 @@ public class KeyStore2 {
             try {
                 return request.execute(service);
             } catch (ServiceSpecificException e) {
-                throw getKeyStoreException(e.errorCode);
+                throw getKeyStoreException(e.errorCode, e.getMessage());
             } catch (RemoteException e) {
                 if (firstTry) {
                     Log.w(TAG, "Looks like we may have lost connection to the Keystore "
@@ -120,12 +120,14 @@ public class KeyStore2 {
                     firstTry = false;
                 } else {
                     Log.e(TAG, "Cannot connect to Keystore daemon.", e);
-                    throw new KeyStoreException(ResponseCode.SYSTEM_ERROR, "");
+                    throw new KeyStoreException(ResponseCode.SYSTEM_ERROR, "", e.getMessage());
                 }
             }
         }
     }
 
+    private static final String KEYSTORE2_SERVICE_NAME =
+            "android.system.keystore2.IKeystoreService/default";
 
     private KeyStore2() {
         mBinder = null;
@@ -138,7 +140,8 @@ public class KeyStore2 {
     private synchronized IKeystoreService getService(boolean retryLookup) {
         if (mBinder == null || retryLookup) {
             mBinder = IKeystoreService.Stub.asInterface(ServiceManager
-                    .getService("android.system.keystore2"));
+                    .getService(KEYSTORE2_SERVICE_NAME));
+            Binder.allowBlocking(mBinder.asBinder());
         }
         return mBinder;
     }
@@ -155,6 +158,15 @@ public class KeyStore2 {
      */
     public KeyDescriptor[] list(int domain, long namespace) throws KeyStoreException {
         return handleRemoteExceptionWithRetry((service) -> service.listEntries(domain, namespace));
+    }
+
+    /**
+     * List all entries in the keystore for in the given namespace.
+     */
+    public KeyDescriptor[] listBatch(int domain, long namespace, String startPastAlias)
+            throws KeyStoreException {
+        return handleRemoteExceptionWithRetry(
+                (service) -> service.listEntriesBatched(domain, namespace, startPastAlias));
     }
 
     /**
@@ -298,6 +310,13 @@ public class KeyStore2 {
         });
     }
 
+    /**
+     * Returns the number of Keystore entries for a given domain and namespace.
+     */
+    public int getNumberOfEntries(int domain, long namespace) throws KeyStoreException {
+        return handleRemoteExceptionWithRetry((service)
+                -> service.getNumberOfEntries(domain, namespace));
+    }
     protected static void interruptedPreservingSleep(long millis) {
         boolean wasInterrupted = false;
         Calendar calendar = Calendar.getInstance();
@@ -319,26 +338,38 @@ public class KeyStore2 {
         }
     }
 
-    static KeyStoreException getKeyStoreException(int errorCode) {
+    static KeyStoreException getKeyStoreException(int errorCode, String serviceErrorMessage) {
         if (errorCode > 0) {
             // KeyStore layer error
             switch (errorCode) {
                 case ResponseCode.LOCKED:
-                    return new KeyStoreException(errorCode, "User authentication required");
+                    return new KeyStoreException(errorCode, "User authentication required",
+                            serviceErrorMessage);
                 case ResponseCode.UNINITIALIZED:
-                    return new KeyStoreException(errorCode, "Keystore not initialized");
+                    return new KeyStoreException(errorCode, "Keystore not initialized",
+                            serviceErrorMessage);
                 case ResponseCode.SYSTEM_ERROR:
-                    return new KeyStoreException(errorCode, "System error");
+                    return new KeyStoreException(errorCode, "System error", serviceErrorMessage);
                 case ResponseCode.PERMISSION_DENIED:
-                    return new KeyStoreException(errorCode, "Permission denied");
+                    return new KeyStoreException(errorCode, "Permission denied",
+                            serviceErrorMessage);
                 case ResponseCode.KEY_NOT_FOUND:
-                    return new KeyStoreException(errorCode, "Key not found");
+                    return new KeyStoreException(errorCode, "Key not found", serviceErrorMessage);
                 case ResponseCode.VALUE_CORRUPTED:
-                    return new KeyStoreException(errorCode, "Key blob corrupted");
+                    return new KeyStoreException(errorCode, "Key blob corrupted",
+                            serviceErrorMessage);
                 case ResponseCode.KEY_PERMANENTLY_INVALIDATED:
-                    return new KeyStoreException(errorCode, "Key permanently invalidated");
+                    return new KeyStoreException(errorCode, "Key permanently invalidated",
+                            serviceErrorMessage);
+                case ResponseCode.OUT_OF_KEYS:
+                    // Getting a more specific RKP status requires the security level, which we
+                    // don't have here. Higher layers of the stack can interpret this exception
+                    // and add more flavor.
+                    return new KeyStoreException(errorCode, serviceErrorMessage,
+                            KeyStoreException.RKP_TEMPORARILY_UNAVAILABLE);
                 default:
-                    return new KeyStoreException(errorCode, String.valueOf(errorCode));
+                    return new KeyStoreException(errorCode, String.valueOf(errorCode),
+                            serviceErrorMessage);
             }
         } else {
             // Keymaster layer error
@@ -347,10 +378,12 @@ public class KeyStore2 {
                     // The name of this parameter significantly differs between Keymaster and
                     // framework APIs. Use the framework wording to make life easier for developers.
                     return new KeyStoreException(errorCode,
-                            "Invalid user authentication validity duration");
+                            "Invalid user authentication validity duration",
+                            serviceErrorMessage);
                 default:
                     return new KeyStoreException(errorCode,
-                            KeymasterDefs.getErrorMessage(errorCode));
+                            KeymasterDefs.getErrorMessage(errorCode),
+                            serviceErrorMessage);
             }
         }
     }

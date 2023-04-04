@@ -27,6 +27,7 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.RemoteException;
 import android.os.ServiceManager;
+import android.service.carrier.CarrierService;
 import android.telephony.Annotation.CallState;
 import android.telephony.Annotation.DataActivityType;
 import android.telephony.Annotation.DisconnectCauses;
@@ -36,19 +37,30 @@ import android.telephony.Annotation.PreciseDisconnectCauses;
 import android.telephony.Annotation.RadioPowerState;
 import android.telephony.Annotation.SimActivationState;
 import android.telephony.Annotation.SrvccState;
+import android.telephony.TelephonyManager.CarrierPrivilegesCallback;
 import android.telephony.emergency.EmergencyNumber;
 import android.telephony.ims.ImsReasonInfo;
 import android.util.ArraySet;
 import android.util.Log;
 
+import com.android.internal.annotations.GuardedBy;
+import com.android.internal.listeners.ListenerExecutor;
+import com.android.internal.telephony.ICarrierConfigChangeListener;
+import com.android.internal.telephony.ICarrierPrivilegesCallback;
 import com.android.internal.telephony.IOnSubscriptionsChangedListener;
 import com.android.internal.telephony.ITelephonyRegistry;
 
+import java.lang.ref.WeakReference;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.stream.Collectors;
 
 /**
  * A centralized place to notify telephony related status changes, e.g, {@link ServiceState} update
@@ -79,6 +91,14 @@ public class TelephonyRegistryManager {
     private final Map<SubscriptionManager.OnOpportunisticSubscriptionsChangedListener,
             IOnSubscriptionsChangedListener> mOpportunisticSubscriptionChangedListenerMap
             = new HashMap<>();
+
+    /**
+     * A mapping between {@link CarrierConfigManager.CarrierConfigChangeListener} and its callback
+     * ICarrierConfigChangeListener.
+     */
+    private final ConcurrentHashMap<CarrierConfigManager.CarrierConfigChangeListener,
+                ICarrierConfigChangeListener>
+            mCarrierConfigChangeListenerMap = new ConcurrentHashMap<>();
 
 
     /** @hide **/
@@ -111,7 +131,12 @@ public class TelephonyRegistryManager {
         IOnSubscriptionsChangedListener callback = new IOnSubscriptionsChangedListener.Stub() {
             @Override
             public void onSubscriptionsChanged () {
-                executor.execute(() -> listener.onSubscriptionsChanged());
+                final long identity = Binder.clearCallingIdentity();
+                try {
+                    executor.execute(() -> listener.onSubscriptionsChanged());
+                } finally {
+                    Binder.restoreCallingIdentity(identity);
+                }
             }
         };
         mSubscriptionChangedListenerMap.put(listener, callback);
@@ -120,6 +145,7 @@ public class TelephonyRegistryManager {
                     mContext.getAttributionTag(), callback);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -141,6 +167,7 @@ public class TelephonyRegistryManager {
             mSubscriptionChangedListenerMap.remove(listener);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -183,6 +210,7 @@ public class TelephonyRegistryManager {
                     mContext.getAttributionTag(), callback);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -205,6 +233,7 @@ public class TelephonyRegistryManager {
             mOpportunisticSubscriptionChangedListenerMap.remove(listener);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -224,8 +253,10 @@ public class TelephonyRegistryManager {
      * @param events Events
      * @param notifyNow Whether to notify instantly
      */
-    public void listenFromListener(int subId, @NonNull String pkg, @NonNull String featureId,
-            @NonNull PhoneStateListener listener, @NonNull int events, boolean notifyNow) {
+    public void listenFromListener(int subId, @NonNull boolean renounceFineLocationAccess,
+            @NonNull boolean renounceCoarseLocationAccess, @NonNull String pkg,
+            @NonNull String featureId, @NonNull PhoneStateListener listener,
+            @NonNull int events, boolean notifyNow) {
         if (listener == null) {
             throw new IllegalStateException("telephony service is null.");
         }
@@ -242,7 +273,7 @@ public class TelephonyRegistryManager {
             } else if (listener.mSubId != null) {
                 subId = listener.mSubId;
             }
-            sRegistry.listenWithEventList(
+            sRegistry.listenWithEventList(renounceFineLocationAccess, renounceCoarseLocationAccess,
                     subId, pkg, featureId, listener.callback, eventsList, notifyNow);
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
@@ -258,11 +289,13 @@ public class TelephonyRegistryManager {
      * @param events List events
      * @param notifyNow Whether to notify instantly
      */
-    private void listenFromCallback(int subId, @NonNull String pkg, @NonNull String featureId,
+    private void listenFromCallback(boolean renounceFineLocationAccess,
+            boolean renounceCoarseLocationAccess, int subId,
+            @NonNull String pkg, @NonNull String featureId,
             @NonNull TelephonyCallback telephonyCallback, @NonNull int[] events,
             boolean notifyNow) {
         try {
-            sRegistry.listenWithEventList(
+            sRegistry.listenWithEventList(renounceFineLocationAccess, renounceCoarseLocationAccess,
                     subId, pkg, featureId, telephonyCallback.callback, events, notifyNow);
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
@@ -278,6 +311,8 @@ public class TelephonyRegistryManager {
      * UI. There is no timeout associated with showing this UX, so a carrier app must be sure to
      * call with active set to false sometime after calling with it set to {@code true}.
      * <p>
+     * This will apply to all subscriptions the carrier app has carrier privileges on.
+     * <p>
      * Requires Permission: calling app has carrier privileges.
      *
      * @param active Whether the carrier network change is or shortly will be
@@ -289,24 +324,52 @@ public class TelephonyRegistryManager {
             sRegistry.notifyCarrierNetworkChange(active);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Informs the system of an intentional upcoming carrier network change by a carrier app on the
+     * given {@code subscriptionId}. This call only used to allow the system to provide alternative
+     * UI while telephony is performing an action that may result in intentional, temporary network
+     * lack of connectivity.
+     * <p>
+     * Based on the active parameter passed in, this method will either show or hide the
+     * alternative UI. There is no timeout associated with showing this UX, so a carrier app must be
+     * sure to call with active set to false sometime after calling with it set to {@code true}.
+     * <p>
+     * Requires Permission: calling app has carrier privileges.
+     *
+     * @param subscriptionId the subscription of the carrier network.
+     * @param active whether the carrier network change is or shortly will be active. Set this value
+     *              to true to begin showing alternative UI and false to stop.
+     * @see TelephonyManager#hasCarrierPrivileges
+     */
+    public void notifyCarrierNetworkChange(int subscriptionId, boolean active) {
+        try {
+            sRegistry.notifyCarrierNetworkChangeWithSubId(subscriptionId, active);
+        } catch (RemoteException ex) {
+            // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
     /**
      * Notify call state changed on certain subscription.
      *
-     * @param subId for which call state changed.
      * @param slotIndex for which call state changed. Can be derived from subId except when subId is
      * invalid.
+     * @param subId for which call state changed.
      * @param state latest call state. e.g, offhook, ringing
      * @param incomingNumber incoming phone number.
      */
-    public void notifyCallStateChanged(int subId, int slotIndex, @CallState int state,
+    public void notifyCallStateChanged(int slotIndex, int subId, @CallState int state,
             @Nullable String incomingNumber) {
         try {
             sRegistry.notifyCallState(slotIndex, subId, state, incomingNumber);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -324,6 +387,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyCallStateForAllSubs(state, incomingNumber);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -336,6 +400,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifySubscriptionInfoChanged();
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -348,6 +413,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyOpportunisticSubscriptionInfoChanged();
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -364,6 +430,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyServiceStateForPhoneId(slotIndex, subId, state);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -381,6 +448,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifySignalStrengthForPhoneId(slotIndex, subId, signalStrength);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -399,6 +467,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyMessageWaitingChangedForPhoneId(slotIndex, subId, msgWaitingInd);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -414,6 +483,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyCallForwardingChangedForSubscriber(subId, callForwardInd);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -429,6 +499,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyDataActivityForSubscriber(subId, dataActivityType);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -450,6 +521,7 @@ public class TelephonyRegistryManager {
                     slotIndex, subId, preciseState);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -468,6 +540,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyCallQualityChanged(callQuality, slotIndex, subId, networkType);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -483,6 +556,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyEmergencyNumberList(slotIndex, subId);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -498,6 +572,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyOutgoingEmergencyCall(phoneId, subId, emergencyNumber);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -513,6 +588,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyOutgoingEmergencySms(phoneId, subId, emergencyNumber);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -530,6 +606,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyRadioPowerStateChanged(slotIndex, subId, radioPowerState);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -543,6 +620,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyPhoneCapabilityChanged(phoneCapability);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -575,6 +653,7 @@ public class TelephonyRegistryManager {
                     SIM_ACTIVATION_TYPE_DATA, activationState);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -594,6 +673,7 @@ public class TelephonyRegistryManager {
                     SIM_ACTIVATION_TYPE_VOICE, activationState);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -611,6 +691,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyUserMobileDataStateChangedForPhoneId(slotIndex, subId, state);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -629,6 +710,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyDisplayInfoChanged(slotIndex, subscriptionId, telephonyDisplayInfo);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -643,6 +725,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyImsDisconnectCause(subId, imsReasonInfo);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -658,6 +741,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifySrvccStateChanged(subId, state);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -681,6 +765,7 @@ public class TelephonyRegistryManager {
                 foregroundCallPreciseState, backgroundCallPreciseState);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -701,6 +786,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyDisconnectCause(slotIndex, subId, cause, preciseCause);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -715,6 +801,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyCellLocationForSubscriber(subId, cellLocation);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -729,7 +816,7 @@ public class TelephonyRegistryManager {
         try {
             sRegistry.notifyCellInfoForSubscriber(subId, cellInfo);
         } catch (RemoteException ex) {
-
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -741,7 +828,7 @@ public class TelephonyRegistryManager {
         try {
             sRegistry.notifyActiveDataSubIdChanged(activeDataSubId);
         } catch (RemoteException ex) {
-
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -774,6 +861,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyRegistrationFailed(slotIndex, subId, cellIdentity,
                     chosenPlmn, domain, causeCode, additionalCauseCode);
         } catch (RemoteException ex) {
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -790,21 +878,24 @@ public class TelephonyRegistryManager {
             sRegistry.notifyBarringInfoChanged(slotIndex, subId, barringInfo);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
     /**
      * Notify {@link PhysicalChannelConfig} has changed for a specific subscription.
      *
+     * @param slotIndex for which physical channel configs changed.
      * @param subId the subId
      * @param configs a list of {@link PhysicalChannelConfig}, the configs of physical channel.
      */
-    public void notifyPhysicalChannelConfigForSubscriber(
-            int subId, List<PhysicalChannelConfig> configs) {
+    public void notifyPhysicalChannelConfigForSubscriber(int slotIndex, int subId,
+            List<PhysicalChannelConfig> configs) {
         try {
-            sRegistry.notifyPhysicalChannelConfigForSubscriber(subId, configs);
+            sRegistry.notifyPhysicalChannelConfigForSubscriber(slotIndex, subId, configs);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -821,22 +912,26 @@ public class TelephonyRegistryManager {
             sRegistry.notifyDataEnabled(slotIndex, subId, enabled, reason);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
     /**
-     * Notify emergency number list changed on certain subscription.
-     *
-     * @param slotIndex for which emergency number list changed. Can be derived from subId except
-     * when subId is invalid.
-     * @param subId for which emergency number list changed.
+     * Notify the allowed network types has changed for a specific subscription and the specific
+     * reason.
+     * @param slotIndex for which allowed network types changed.
+     * @param subId for which allowed network types changed.
+     * @param reason an allowed network type reasons.
+     * @param allowedNetworkType an allowed network type bitmask value.
      */
     public void notifyAllowedNetworkTypesChanged(int slotIndex, int subId,
-            Map<Integer, Long> allowedNetworkTypeList) {
+            int reason, long allowedNetworkType) {
         try {
-            sRegistry.notifyAllowedNetworkTypesChanged(slotIndex, subId, allowedNetworkTypeList);
+            sRegistry.notifyAllowedNetworkTypesChanged(slotIndex, subId, reason,
+                    allowedNetworkType);
         } catch (RemoteException ex) {
             // system process is dead
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -852,6 +947,7 @@ public class TelephonyRegistryManager {
             sRegistry.notifyLinkCapacityEstimateChanged(slotIndex, subId, linkCapacityEstimateList);
         } catch (RemoteException ex) {
             // system server crash
+            throw ex.rethrowFromSystemServer();
         }
     }
 
@@ -875,6 +971,7 @@ public class TelephonyRegistryManager {
             eventList.add(TelephonyCallback.EVENT_CELL_LOCATION_CHANGED);
         }
 
+        // Note: Legacy PhoneStateListeners use EVENT_LEGACY_CALL_STATE_CHANGED
         if (telephonyCallback instanceof TelephonyCallback.CallStateListener) {
             eventList.add(TelephonyCallback.EVENT_CALL_STATE_CHANGED);
         }
@@ -889,10 +986,6 @@ public class TelephonyRegistryManager {
 
         if (telephonyCallback instanceof TelephonyCallback.SignalStrengthsListener) {
             eventList.add(TelephonyCallback.EVENT_SIGNAL_STRENGTHS_CHANGED);
-        }
-
-        if (telephonyCallback instanceof TelephonyCallback.AlwaysReportedSignalStrengthListener) {
-            eventList.add(TelephonyCallback.EVENT_ALWAYS_REPORTED_SIGNAL_STRENGTH_CHANGED);
         }
 
         if (telephonyCallback instanceof TelephonyCallback.CellInfoListener) {
@@ -1018,8 +1111,10 @@ public class TelephonyRegistryManager {
             eventList.add(TelephonyCallback.EVENT_CELL_LOCATION_CHANGED);
         }
 
+        // Note: Legacy call state listeners can get the phone number which is not provided in the
+        // new version in TelephonyCallback.
         if ((eventMask & PhoneStateListener.LISTEN_CALL_STATE) != 0) {
-            eventList.add(TelephonyCallback.EVENT_CALL_STATE_CHANGED);
+            eventList.add(TelephonyCallback.EVENT_LEGACY_CALL_STATE_CHANGED);
         }
 
         if ((eventMask & PhoneStateListener.LISTEN_DATA_CONNECTION_STATE) != 0) {
@@ -1032,10 +1127,6 @@ public class TelephonyRegistryManager {
 
         if ((eventMask & PhoneStateListener.LISTEN_SIGNAL_STRENGTHS) != 0) {
             eventList.add(TelephonyCallback.EVENT_SIGNAL_STRENGTHS_CHANGED);
-        }
-
-        if ((eventMask & PhoneStateListener.LISTEN_ALWAYS_REPORTED_SIGNAL_STRENGTH) != 0) {
-            eventList.add(TelephonyCallback.EVENT_ALWAYS_REPORTED_SIGNAL_STRENGTH_CHANGED);
         }
 
         if ((eventMask & PhoneStateListener.LISTEN_CELL_INFO) != 0) {
@@ -1158,14 +1249,17 @@ public class TelephonyRegistryManager {
      *
      * @param callback The {@link TelephonyCallback} object to register.
      */
-    public void registerTelephonyCallback(@NonNull @CallbackExecutor Executor executor,
+    public void registerTelephonyCallback(boolean renounceFineLocationAccess,
+            boolean renounceCoarseLocationAccess,
+            @NonNull @CallbackExecutor Executor executor,
             int subId, String pkgName, String attributionTag, @NonNull TelephonyCallback callback,
             boolean notifyNow) {
         if (callback == null) {
             throw new IllegalStateException("telephony service is null.");
         }
         callback.init(executor);
-        listenFromCallback(subId, pkgName, attributionTag, callback,
+        listenFromCallback(renounceFineLocationAccess, renounceCoarseLocationAccess, subId,
+                pkgName, attributionTag, callback,
                 getEventsFromCallback(callback).stream().mapToInt(i -> i).toArray(), notifyNow);
     }
 
@@ -1176,6 +1270,244 @@ public class TelephonyRegistryManager {
      */
     public void unregisterTelephonyCallback(int subId, String pkgName, String attributionTag,
             @NonNull TelephonyCallback callback, boolean notifyNow) {
-        listenFromCallback(subId, pkgName, attributionTag, callback, new int[0], notifyNow);
+        listenFromCallback(false, false, subId,
+                pkgName, attributionTag, callback, new int[0], notifyNow);
+    }
+
+    private static class CarrierPrivilegesCallbackWrapper extends ICarrierPrivilegesCallback.Stub
+            implements ListenerExecutor {
+        @NonNull private final WeakReference<CarrierPrivilegesCallback> mCallback;
+        @NonNull private final Executor mExecutor;
+
+        CarrierPrivilegesCallbackWrapper(
+                @NonNull CarrierPrivilegesCallback callback, @NonNull Executor executor) {
+            mCallback = new WeakReference<>(callback);
+            mExecutor = executor;
+        }
+
+        @Override
+        public void onCarrierPrivilegesChanged(
+                @NonNull List<String> privilegedPackageNames, @NonNull int[] privilegedUids) {
+            // AIDL interface does not support Set, keep the List/Array and translate them here
+            Set<String> privilegedPkgNamesSet = Set.copyOf(privilegedPackageNames);
+            Set<Integer> privilegedUidsSet = Arrays.stream(privilegedUids).boxed().collect(
+                    Collectors.toSet());
+            Binder.withCleanCallingIdentity(
+                    () ->
+                            executeSafely(
+                                    mExecutor,
+                                    mCallback::get,
+                                    cpc ->
+                                            cpc.onCarrierPrivilegesChanged(
+                                                    privilegedPkgNamesSet, privilegedUidsSet)));
+        }
+
+        @Override
+        public void onCarrierServiceChanged(@Nullable String packageName, int uid) {
+            Binder.withCleanCallingIdentity(
+                    () ->
+                            executeSafely(
+                                    mExecutor,
+                                    mCallback::get,
+                                    cpc -> cpc.onCarrierServiceChanged(packageName, uid)));
+        }
+    }
+
+    @NonNull
+    @GuardedBy("sCarrierPrivilegeCallbacks")
+    private static final WeakHashMap<CarrierPrivilegesCallback,
+            WeakReference<CarrierPrivilegesCallbackWrapper>>
+            sCarrierPrivilegeCallbacks = new WeakHashMap<>();
+
+    /**
+     * Registers a {@link CarrierPrivilegesCallback} on the given {@code logicalSlotIndex} to
+     * receive callbacks when the set of packages with carrier privileges changes. The callback will
+     * immediately be called with the latest state.
+     *
+     * @param logicalSlotIndex The SIM slot to listen on
+     * @param executor The executor where {@code listener} will be invoked
+     * @param callback The callback to register
+     */
+    public void addCarrierPrivilegesCallback(
+            int logicalSlotIndex,
+            @NonNull @CallbackExecutor Executor executor,
+            @NonNull CarrierPrivilegesCallback callback) {
+        if (callback == null || executor == null) {
+            throw new IllegalArgumentException("callback and executor must be non-null");
+        }
+        synchronized (sCarrierPrivilegeCallbacks) {
+            WeakReference<CarrierPrivilegesCallbackWrapper> existing =
+                    sCarrierPrivilegeCallbacks.get(callback);
+            if (existing != null && existing.get() != null) {
+                Log.d(TAG, "addCarrierPrivilegesCallback: callback already registered");
+                return;
+            }
+            CarrierPrivilegesCallbackWrapper wrapper =
+                    new CarrierPrivilegesCallbackWrapper(callback, executor);
+            sCarrierPrivilegeCallbacks.put(callback, new WeakReference<>(wrapper));
+            try {
+                sRegistry.addCarrierPrivilegesCallback(
+                        logicalSlotIndex,
+                        wrapper,
+                        mContext.getOpPackageName(),
+                        mContext.getAttributionTag());
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+    }
+
+    /**
+     * Unregisters a {@link CarrierPrivilegesCallback}.
+     *
+     * @param callback The callback to unregister
+     */
+    public void removeCarrierPrivilegesCallback(@NonNull CarrierPrivilegesCallback callback) {
+        if (callback == null) {
+            throw new IllegalArgumentException("listener must be non-null");
+        }
+        synchronized (sCarrierPrivilegeCallbacks) {
+            WeakReference<CarrierPrivilegesCallbackWrapper> ref =
+                    sCarrierPrivilegeCallbacks.remove(callback);
+            if (ref == null) return;
+            CarrierPrivilegesCallbackWrapper wrapper = ref.get();
+            if (wrapper == null) return;
+            try {
+                sRegistry.removeCarrierPrivilegesCallback(wrapper, mContext.getOpPackageName());
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+    }
+
+    /**
+     * Notify listeners that the set of packages with carrier privileges has changed.
+     *
+     * @param logicalSlotIndex The SIM slot the change occurred on
+     * @param privilegedPackageNames The updated set of packages names with carrier privileges
+     * @param privilegedUids The updated set of UIDs with carrier privileges
+     */
+    public void notifyCarrierPrivilegesChanged(
+            int logicalSlotIndex,
+            @NonNull Set<String> privilegedPackageNames,
+            @NonNull Set<Integer> privilegedUids) {
+        if (privilegedPackageNames == null || privilegedUids == null) {
+            throw new IllegalArgumentException(
+                    "privilegedPackageNames and privilegedUids must be non-null");
+        }
+        try {
+            // AIDL doesn't support Set yet. Convert Set to List/Array
+            List<String> pkgList = List.copyOf(privilegedPackageNames);
+            int[] uids = privilegedUids.stream().mapToInt(Number::intValue).toArray();
+            sRegistry.notifyCarrierPrivilegesChanged(logicalSlotIndex, pkgList, uids);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notify listeners that the {@link CarrierService} for current user has changed.
+     *
+     * @param logicalSlotIndex the SIM slot the change occurred on
+     * @param packageName the package name of the changed {@link CarrierService}
+     * @param uid the UID of the changed {@link CarrierService}
+     */
+    public void notifyCarrierServiceChanged(int logicalSlotIndex, @Nullable String packageName,
+            int uid) {
+        try {
+            sRegistry.notifyCarrierServiceChanged(logicalSlotIndex, packageName, uid);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Register a {@link android.telephony.CarrierConfigManager.CarrierConfigChangeListener} to get
+     * notification when carrier configurations have changed.
+     *
+     * @param executor The executor on which the callback will be executed.
+     * @param listener The CarrierConfigChangeListener to be registered with.
+     */
+    public void addCarrierConfigChangedListener(
+            @NonNull @CallbackExecutor Executor executor,
+            @NonNull CarrierConfigManager.CarrierConfigChangeListener listener) {
+        Objects.requireNonNull(executor, "Executor should be non-null.");
+        Objects.requireNonNull(listener, "Listener should be non-null.");
+        if (mCarrierConfigChangeListenerMap.get(listener) != null) {
+            Log.e(TAG, "registerCarrierConfigChangeListener: listener already present");
+            return;
+        }
+
+        ICarrierConfigChangeListener callback = new ICarrierConfigChangeListener.Stub() {
+            @Override
+            public void onCarrierConfigChanged(int slotIndex, int subId, int carrierId,
+                    int specificCarrierId) {
+                Log.d(TAG, "onCarrierConfigChanged call in ICarrierConfigChangeListener callback");
+                final long identify = Binder.clearCallingIdentity();
+                try {
+                    executor.execute(() -> listener.onCarrierConfigChanged(slotIndex, subId,
+                            carrierId, specificCarrierId));
+                } finally {
+                    Binder.restoreCallingIdentity(identify);
+                }
+            }
+        };
+
+        try {
+            sRegistry.addCarrierConfigChangeListener(callback,
+                    mContext.getOpPackageName(), mContext.getAttributionTag());
+            mCarrierConfigChangeListenerMap.put(listener, callback);
+        } catch (RemoteException re) {
+            // system server crashes
+            throw re.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Unregister to stop the notification when carrier configurations changed.
+     *
+     * @param listener The CarrierConfigChangeListener to be unregistered with.
+     */
+    public void removeCarrierConfigChangedListener(
+            @NonNull CarrierConfigManager.CarrierConfigChangeListener listener) {
+        Objects.requireNonNull(listener, "Listener should be non-null.");
+        if (mCarrierConfigChangeListenerMap.get(listener) == null) {
+            Log.e(TAG, "removeCarrierConfigChangedListener: listener was not present");
+            return;
+        }
+
+        try {
+            sRegistry.removeCarrierConfigChangeListener(
+                    mCarrierConfigChangeListenerMap.get(listener), mContext.getOpPackageName());
+            mCarrierConfigChangeListenerMap.remove(listener);
+        } catch (RemoteException re) {
+            // System sever crashes
+            throw re.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notify the registrants the carrier configurations have changed.
+     *
+     * @param slotIndex         The SIM slot index on which to monitor and get notification.
+     * @param subId             The subscription on the SIM slot. May be
+     *                          {@link SubscriptionManager#INVALID_SUBSCRIPTION_ID}.
+     * @param carrierId         The optional carrier Id, may be
+     *                          {@link TelephonyManager#UNKNOWN_CARRIER_ID}.
+     * @param specificCarrierId The optional specific carrier Id, may be {@link
+     *                          TelephonyManager#UNKNOWN_CARRIER_ID}.
+     */
+    public void notifyCarrierConfigChanged(int slotIndex, int subId, int carrierId,
+            int specificCarrierId) {
+        // Only validate slotIndex, all others are optional and allowed to be invalid
+        if (!SubscriptionManager.isValidPhoneId(slotIndex)) {
+            Log.e(TAG, "notifyCarrierConfigChanged, ignored: invalid slotIndex " + slotIndex);
+            return;
+        }
+        try {
+            sRegistry.notifyCarrierConfigChanged(slotIndex, subId, carrierId, specificCarrierId);
+        } catch (RemoteException re) {
+            throw re.rethrowFromSystemServer();
+        }
     }
 }

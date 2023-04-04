@@ -50,8 +50,13 @@ class Dimmer {
         }
 
         @Override
-        public SurfaceControl.Transaction getPendingTransaction() {
+        public SurfaceControl.Transaction getSyncTransaction() {
             return mHost.getSyncTransaction();
+        }
+
+        @Override
+        public SurfaceControl.Transaction getPendingTransaction() {
+            return mHost.getPendingTransaction();
         }
 
         @Override
@@ -105,7 +110,7 @@ class Dimmer {
 
         void removeSurface() {
             if (mDimLayer != null && mDimLayer.isValid()) {
-                getPendingTransaction().remove(mDimLayer);
+                getSyncTransaction().remove(mDimLayer);
             }
             mDimLayer = null;
         }
@@ -204,50 +209,21 @@ class Dimmer {
     }
 
     private void dim(SurfaceControl.Transaction t, WindowContainer container, int relativeLayer,
-            float alpha) {
+            float alpha, int blurRadius) {
         final DimState d = getDimState(container);
 
         if (d == null) {
             return;
         }
 
-        if (container != null) {
-            // The dim method is called from WindowState.prepareSurfaces(), which is always called
-            // in the correct Z from lowest Z to highest. This ensures that the dim layer is always
-            // relative to the highest Z layer with a dim.
-            t.setRelativeLayer(d.mDimLayer, container.getSurfaceControl(), relativeLayer);
-        } else {
-            t.setLayer(d.mDimLayer, Integer.MAX_VALUE);
-        }
+        // The dim method is called from WindowState.prepareSurfaces(), which is always called
+        // in the correct Z from lowest Z to highest. This ensures that the dim layer is always
+        // relative to the highest Z layer with a dim.
+        t.setRelativeLayer(d.mDimLayer, container.getSurfaceControl(), relativeLayer);
         t.setAlpha(d.mDimLayer, alpha);
+        t.setBackgroundBlurRadius(d.mDimLayer, blurRadius);
 
         d.mDimming = true;
-    }
-
-    /**
-     * Finish a dim started by dimAbove in the case there was no call to dimAbove.
-     *
-     * @param t A Transaction in which to finish the dim.
-     */
-    void stopDim(SurfaceControl.Transaction t) {
-        if (mDimState != null) {
-            t.hide(mDimState.mDimLayer);
-            mDimState.isVisible = false;
-            mDimState.mDontReset = false;
-        }
-    }
-
-    /**
-     * Place a Dim above the entire host container. The caller is responsible for calling stopDim to
-     * remove this effect. If the Dim can be assosciated with a particular child of the host
-     * consider using the other variant of dimAbove which ties the Dim lifetime to the child
-     * lifetime more explicitly.
-     *
-     * @param t     A transaction in which to apply the Dim.
-     * @param alpha The alpha at which to Dim.
-     */
-    void dimAbove(SurfaceControl.Transaction t, float alpha) {
-        dim(t, null, 1, alpha);
     }
 
     /**
@@ -260,19 +236,21 @@ class Dimmer {
      * @param alpha     The alpha at which to Dim.
      */
     void dimAbove(SurfaceControl.Transaction t, WindowContainer container, float alpha) {
-        dim(t, container, 1, alpha);
+        dim(t, container, 1, alpha, 0);
     }
 
     /**
      * Like {@link #dimAbove} but places the dim below the given container.
      *
-     * @param t         A transaction in which to apply the Dim.
-     * @param container The container which to dim below. Should be a child of our host.
-     * @param alpha     The alpha at which to Dim.
+     * @param t          A transaction in which to apply the Dim.
+     * @param container  The container which to dim below. Should be a child of our host.
+     * @param alpha      The alpha at which to Dim.
+     * @param blurRadius The amount of blur added to the Dim.
      */
 
-    void dimBelow(SurfaceControl.Transaction t, WindowContainer container, float alpha) {
-        dim(t, container, -1, alpha);
+    void dimBelow(SurfaceControl.Transaction t, WindowContainer container, float alpha,
+                  int blurRadius) {
+        dim(t, container, -1, alpha, blurRadius);
     }
 
     /**

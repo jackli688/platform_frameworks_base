@@ -18,6 +18,8 @@ package android.content.pm;
 
 import android.annotation.IntDef;
 import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.annotation.TestApi;
 import android.annotation.UserIdInt;
 import android.compat.annotation.UnsupportedAppUsage;
 import android.os.Parcel;
@@ -47,6 +49,7 @@ import java.lang.annotation.RetentionPolicy;
  *
  * @hide
  */
+@TestApi
 public class UserInfo implements Parcelable {
 
     /**
@@ -140,6 +143,22 @@ public class UserInfo implements Parcelable {
     public static final int FLAG_PROFILE = 0x00001000;
 
     /**
+     * Indicates that this user is created in ephemeral mode via
+     * {@link IUserManager} create user.
+     *
+     * When a user is created with {@link #FLAG_EPHEMERAL}, {@link #FLAG_EPHEMERAL_ON_CREATE}
+     * is set internally within the user manager.
+     *
+     * When {@link #FLAG_EPHEMERAL_ON_CREATE} is set {@link IUserManager.setUserEphemeral}
+     * has no effect because a user that was created ephemeral can never be made non-ephemeral.
+     *
+     * {@link #FLAG_EPHEMERAL_ON_CREATE} should NOT be set by client's of user manager
+     *
+     * @hide
+     */
+    public static final int FLAG_EPHEMERAL_ON_CREATE = 0x00002000;
+
+    /**
      * @hide
      */
     @IntDef(flag = true, prefix = "FLAG_", value = {
@@ -155,7 +174,8 @@ public class UserInfo implements Parcelable {
             FLAG_DEMO,
             FLAG_FULL,
             FLAG_SYSTEM,
-            FLAG_PROFILE
+            FLAG_PROFILE,
+            FLAG_EPHEMERAL_ON_CREATE
     })
     @Retention(RetentionPolicy.SOURCE)
     public @interface UserInfoFlag {
@@ -168,7 +188,7 @@ public class UserInfo implements Parcelable {
     @UnsupportedAppUsage
     public int serialNumber;
     @UnsupportedAppUsage
-    public String name;
+    public @Nullable String name;
     @UnsupportedAppUsage
     public String iconPath;
     @UnsupportedAppUsage
@@ -319,6 +339,10 @@ public class UserInfo implements Parcelable {
         return UserManager.isUserTypeManagedProfile(userType);
     }
 
+    public boolean isCloneProfile() {
+        return UserManager.isUserTypeCloneProfile(userType);
+    }
+
     @UnsupportedAppUsage
     public boolean isEnabled() {
         return (flags & FLAG_DISABLED) != FLAG_DISABLED;
@@ -337,7 +361,7 @@ public class UserInfo implements Parcelable {
     }
 
     public boolean isDemo() {
-        return UserManager.isUserTypeDemo(userType);
+        return UserManager.isUserTypeDemo(userType) || (flags & FLAG_DEMO) != 0;
     }
 
     public boolean isFull() {
@@ -366,8 +390,9 @@ public class UserInfo implements Parcelable {
      * @return true if this user can be switched to.
      **/
     public boolean supportsSwitchTo() {
-        if (isEphemeral() && !isEnabled()) {
-            // Don't support switching to an ephemeral user with removal in progress.
+        if (partial || !isEnabled()) {
+            // Don't support switching to disabled or partial users, which includes users with
+            // removal in progress.
             return false;
         }
         if (preCreated) {

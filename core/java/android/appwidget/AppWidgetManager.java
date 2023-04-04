@@ -23,6 +23,8 @@ import android.annotation.RequiresFeature;
 import android.annotation.SdkConstant;
 import android.annotation.SdkConstant.SdkConstantType;
 import android.annotation.SystemService;
+import android.annotation.TestApi;
+import android.annotation.UserIdInt;
 import android.app.IServiceConnection;
 import android.app.PendingIntent;
 import android.compat.annotation.UnsupportedAppUsage;
@@ -40,12 +42,15 @@ import android.os.Handler;
 import android.os.RemoteException;
 import android.os.UserHandle;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.widget.RemoteViews;
 
 import com.android.internal.appwidget.IAppWidgetService;
+import com.android.internal.os.BackgroundThread;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Updates AppWidget state; gets information about installed AppWidget providers and other
@@ -60,6 +65,7 @@ import java.util.List;
 @SystemService(Context.APPWIDGET_SERVICE)
 @RequiresFeature(PackageManager.FEATURE_APP_WIDGETS)
 public class AppWidgetManager {
+
 
     /**
      * Activity action to launch from your {@link AppWidgetHost} activity when you want to
@@ -217,6 +223,12 @@ public class AppWidgetManager {
     public static final String OPTION_APPWIDGET_MAX_HEIGHT = "appWidgetMaxHeight";
 
     /**
+     * A bundle extra ({@code List<SizeF>}) that contains the list of possible sizes, in dips, a
+     * widget instance can take.
+     */
+    public static final String OPTION_APPWIDGET_SIZES = "appWidgetSizes";
+
+    /**
      * A bundle extra that hints to the AppWidgetProvider the category of host that owns this
      * this widget. Can have the value {@link
      * AppWidgetProviderInfo#WIDGET_CATEGORY_HOME_SCREEN} or {@link
@@ -322,6 +334,17 @@ public class AppWidgetManager {
     @SdkConstant(SdkConstantType.BROADCAST_INTENT_ACTION)
     @BroadcastBehavior(explicitOnly = true)
     public static final String ACTION_APPWIDGET_UPDATE = "android.appwidget.action.APPWIDGET_UPDATE";
+
+    /**
+     * A combination broadcast of APPWIDGET_ENABLED and APPWIDGET_UPDATE.
+     * Sent during boot time and when the host is binding the widget for the very first time
+     *
+     * @hide
+     */
+    @SdkConstant(SdkConstantType.BROADCAST_INTENT_ACTION)
+    @BroadcastBehavior(explicitOnly = true)
+    public static final String ACTION_APPWIDGET_ENABLE_AND_UPDATE = "android.appwidget.action"
+            + ".APPWIDGET_ENABLE_AND_UPDATE";
 
     /**
      * Sent when the custom extras for an AppWidget change.
@@ -448,6 +471,8 @@ public class AppWidgetManager {
     public static final String ACTION_APPWIDGET_HOST_RESTORED
             = "android.appwidget.action.APPWIDGET_HOST_RESTORED";
 
+    private static final String TAG = "AppWidgetManager";
+
     /**
      * An intent extra that contains multiple appWidgetIds.  These are id values as
      * they were provided to the application during a recent restore from backup.  It is
@@ -503,6 +528,26 @@ public class AppWidgetManager {
         mPackageName = context.getOpPackageName();
         mService = service;
         mDisplayMetrics = context.getResources().getDisplayMetrics();
+        if (mService == null) {
+            return;
+        }
+        BackgroundThread.getExecutor().execute(() -> {
+            try {
+                mService.notifyProviderInheritance(getInstalledProvidersForPackage(mPackageName,
+                        null)
+                        .stream().filter(Objects::nonNull)
+                        .map(info -> info.provider).filter(p -> {
+                            try {
+                                Class clazz = Class.forName(p.getClassName());
+                                return AppWidgetProvider.class.isAssignableFrom(clazz);
+                            } catch (Exception e) {
+                                return false;
+                            }
+                        }).toArray(ComponentName[]::new));
+            } catch (Exception e) {
+                Log.e(TAG, "Nofity service of inheritance info", e);
+            }
+        });
     }
 
     /**
@@ -955,6 +1000,9 @@ public class AppWidgetManager {
     /**
      * Set the component for a given appWidgetId.
      *
+     * If successful, the app widget provider will receive a {@link #ACTION_APPWIDGET_UPDATE}
+     * broadcast.
+     *
      * <p class="note">You need the BIND_APPWIDGET permission or the user must have enabled binding
      *         widgets always for your component. Should be used by apps that host widgets; if this
      *         method returns false, call {@link #ACTION_APPWIDGET_BIND} to request permission to
@@ -974,6 +1022,9 @@ public class AppWidgetManager {
 
     /**
      * Set the component for a given appWidgetId.
+     *
+     * If successful, the app widget provider will receive a {@link #ACTION_APPWIDGET_UPDATE}
+     * broadcast.
      *
      * <p class="note">You need the BIND_APPWIDGET permission or the user must have enabled binding
      *         widgets always for your component. Should be used by apps that host widgets; if this
@@ -998,6 +1049,10 @@ public class AppWidgetManager {
 
     /**
      * Set the provider for a given appWidgetId if the caller has a permission.
+     *
+     * If successful, the app widget provider will receive a {@link #ACTION_APPWIDGET_UPDATE}
+     * broadcast.
+     *
      * <p>
      * <strong>Note:</strong> You need the {@link android.Manifest.permission#BIND_APPWIDGET}
      * permission or the user must have enabled binding widgets always for your component.
@@ -1089,7 +1144,9 @@ public class AppWidgetManager {
      *
      * @hide
      */
-    public void setBindAppWidgetPermission(String packageName, int userId, boolean permission) {
+    @TestApi
+    public void setBindAppWidgetPermission(
+            @NonNull String packageName, @UserIdInt int userId, boolean permission) {
         if (mService == null) {
             return;
         }
@@ -1110,7 +1167,9 @@ public class AppWidgetManager {
      * @param intent        The intent of the service which will be providing the data to the
      *                      RemoteViewsAdapter.
      * @param connection    The callback interface to be notified when a connection is made or lost.
-     * @param flags         Flags used for binding to the service
+     * @param flags         Flags used for binding to the service. Currently only
+     *                     {@link Context#BIND_AUTO_CREATE} and
+     *                     {@link Context#BIND_FOREGROUND_SERVICE_WHILE_AWAKE} are supported.
      *
      * @see Context#getServiceDispatcher(ServiceConnection, Handler, int)
      * @hide

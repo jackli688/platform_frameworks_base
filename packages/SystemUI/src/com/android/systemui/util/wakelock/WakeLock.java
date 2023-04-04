@@ -33,9 +33,14 @@ public interface WakeLock {
     static final String REASON_WRAP = "wrap";
 
     /**
-     * Default wake-lock timeout, to avoid battery regressions.
+     * Default wake-lock timeout in milliseconds, to avoid battery regressions.
      */
     long DEFAULT_MAX_TIMEOUT = 20000;
+
+    /**
+     * Default wake-lock levels and flags.
+     */
+    int DEFAULT_LEVELS_AND_FLAGS = PowerManager.PARTIAL_WAKE_LOCK;
 
     /**
      * @param why A tag that will be saved for sysui dumps.
@@ -60,13 +65,21 @@ public interface WakeLock {
      * Creates a {@link WakeLock} that has a default release timeout.
      * @see android.os.PowerManager.WakeLock#acquire(long) */
     static WakeLock createPartial(Context context, String tag, long maxTimeout) {
-        return wrap(createPartialInner(context, tag), maxTimeout);
+        return wrap(createWakeLockInner(context, tag, DEFAULT_LEVELS_AND_FLAGS), maxTimeout);
+    }
+
+    /**
+     * Creates a {@link WakeLock} that has a default release timeout and flags.
+     */
+    static WakeLock createWakeLock(Context context, String tag, int flags, long maxTimeout) {
+        return wrap(createWakeLockInner(context, tag, flags), maxTimeout);
     }
 
     @VisibleForTesting
-    static PowerManager.WakeLock createPartialInner(Context context, String tag) {
+    static PowerManager.WakeLock createWakeLockInner(
+            Context context, String tag, int levelsAndFlags) {
         return context.getSystemService(PowerManager.class)
-                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, tag);
+                    .newWakeLock(levelsAndFlags, tag);
     }
 
     static Runnable wrapImpl(WakeLock w, Runnable r) {
@@ -104,6 +117,7 @@ public interface WakeLock {
                 if (count == null) {
                     Log.wtf(TAG, "Releasing WakeLock with invalid reason: " + why,
                             new Throwable());
+                    return;
                 } else if (count == 1) {
                     mActiveClients.remove(why);
                 } else {
@@ -130,6 +144,7 @@ public interface WakeLock {
     class Builder {
         private final Context mContext;
         private String mTag;
+        private int mLevelsAndFlags = DEFAULT_LEVELS_AND_FLAGS;
         private long mMaxTimeout = DEFAULT_MAX_TIMEOUT;
 
         @Inject
@@ -142,13 +157,18 @@ public interface WakeLock {
             return this;
         }
 
+        public Builder setLevelsAndFlags(int levelsAndFlags) {
+            this.mLevelsAndFlags = levelsAndFlags;
+            return this;
+        }
+
         public Builder setMaxTimeout(long maxTimeout) {
             this.mMaxTimeout = maxTimeout;
             return this;
         }
 
         public WakeLock build() {
-            return WakeLock.createPartial(mContext, mTag, mMaxTimeout);
+            return WakeLock.createWakeLock(mContext, mTag, mLevelsAndFlags, mMaxTimeout);
         }
     }
 }

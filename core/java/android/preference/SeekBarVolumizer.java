@@ -46,6 +46,8 @@ import android.widget.SeekBar.OnSeekBarChangeListener;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.os.SomeArgs;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * Turns a {@link SeekBar} into a volume control.
  * @hide
@@ -64,9 +66,24 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         void onSampleStarting(SeekBarVolumizer sbv);
         void onProgressChanged(SeekBar seekBar, int progress, boolean fromTouch);
         void onMuted(boolean muted, boolean zenMuted);
+        /**
+         * Callback reporting that the seek bar is start tracking.
+         *
+         * @param sbv - The seek bar that start tracking
+         */
+        void onStartTrackingTouch(SeekBarVolumizer sbv);
+
+        /**
+         * Callback reporting that the seek bar is stop tracking.
+         *
+         * @param sbv - The seek bar that stop tracking
+         */
+        default void onStopTrackingTouch(SeekBarVolumizer sbv) {
+        }
     }
 
     private static final int MSG_GROUP_VOLUME_CHANGED = 1;
+    private static long sStopVolumeTime = 0L;
     private final Handler mVolumeHandler = new VolumeHandler();
     private AudioAttributes mAttributes;
     private int mVolumeGroupId;
@@ -98,6 +115,7 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
     private final int mMaxStreamVolume;
     private boolean mAffectedByRingerMode;
     private boolean mNotificationOrRing;
+    private final boolean mNotifAliasRing;
     private final Receiver mReceiver = new Receiver();
 
     private Handler mHandler;
@@ -126,6 +144,9 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
     private static final int MSG_STOP_SAMPLE = 2;
     private static final int MSG_INIT_SAMPLE = 3;
     private static final int CHECK_RINGTONE_PLAYBACK_DELAY_MS = 1000;
+    private static final long SET_STREAM_VOLUME_DELAY_MS = TimeUnit.MILLISECONDS.toMillis(500);
+    private static final long START_SAMPLE_DELAY_MS = TimeUnit.MILLISECONDS.toMillis(500);
+    private static final long DURATION_TO_START_DELAYING = TimeUnit.MILLISECONDS.toMillis(2000);
 
     private NotificationManager.Policy mNotificationPolicy;
     private boolean mAllowAlarms;
@@ -159,6 +180,8 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         if (mNotificationOrRing) {
             mRingerMode = mAudioManager.getRingerModeInternal();
         }
+        mNotifAliasRing = mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_alias_ring_notif_stream_types);
         mZenMode = mNotificationManager.getZenMode();
 
         if (hasAudioProductStrategies()) {
@@ -203,7 +226,7 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
 
         return AudioManager.getAudioProductStrategies().stream()
                 .map(strategy -> strategy.getVolumeGroupIdForAudioAttributes(
-                        AudioProductStrategy.sDefaultAttributes))
+                        AudioProductStrategy.getDefaultAttributes()))
                 .filter(volumeGroupId -> volumeGroupId != AudioVolumeGroup.DEFAULT_VOLUME_GROUP)
                 .findFirst()
                 .orElse(AudioVolumeGroup.DEFAULT_VOLUME_GROUP);
@@ -260,7 +283,15 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         if (zenMuted) {
             mSeekBar.setProgress(mLastAudibleStreamVolume, true);
         } else if (mNotificationOrRing && mRingerMode == AudioManager.RINGER_MODE_VIBRATE) {
-            mSeekBar.setProgress(0, true);
+            /**
+             * the first variable above is preserved and the conditions below are made explicit
+             * so that when user attempts to slide the notification seekbar out of vibrate the
+             * seekbar doesn't wrongly snap back to 0 when the streams aren't aliased
+             */
+            if (mNotifAliasRing || mStreamType == AudioManager.STREAM_RING
+                    || (mStreamType == AudioManager.STREAM_NOTIFICATION && mMuted)) {
+                mSeekBar.setProgress(0, true);
+            }
         } else if (mMuted) {
             mSeekBar.setProgress(0, true);
         } else {
@@ -314,7 +345,30 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         if (mHandler == null) return;
         mHandler.removeMessages(MSG_START_SAMPLE);
         mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_START_SAMPLE),
-                isSamplePlaying() ? CHECK_RINGTONE_PLAYBACK_DELAY_MS : 0);
+                isSamplePlaying() ? CHECK_RINGTONE_PLAYBACK_DELAY_MS
+                        : isDelay() ? START_SAMPLE_DELAY_MS : 0);
+    }
+
+    // After stop volume it needs to add a small delay when playing volume or set stream.
+    // It is because the call volume is from the earpiece and the alarm/ring/media
+    // is from the speaker. If play the alarm volume or set alarm stream right after stop
+    // call volume, the alarm volume on earpiece is returned then cause the volume value incorrect.
+    // It needs a small delay after stop call volume to get alarm volume on speaker.
+    // e.g. : If the ring volume has adjusted right after call volume stopped in 2 second
+    // then delay 0.5 second to set stream or play volume ringtone.
+    private boolean isDelay() {
+        final long durationTime = java.lang.System.currentTimeMillis() - sStopVolumeTime;
+        return durationTime >= 0 && durationTime < DURATION_TO_START_DELAYING;
+    }
+
+    private void setStopVolumeTime() {
+        // set the time of stop volume
+        if ((mStreamType == AudioManager.STREAM_VOICE_CALL
+                || mStreamType == AudioManager.STREAM_RING
+                || (!mNotifAliasRing && mStreamType == AudioManager.STREAM_NOTIFICATION)
+                || mStreamType == AudioManager.STREAM_ALARM)) {
+            sStopVolumeTime = java.lang.System.currentTimeMillis();
+        }
     }
 
     private void onStartSample() {
@@ -341,6 +395,7 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
 
     private void postStopSample() {
         if (mHandler == null) return;
+        setStopVolumeTime();
         // remove pending delayed start messages
         mHandler.removeMessages(MSG_START_SAMPLE);
         mHandler.removeMessages(MSG_STOP_SAMPLE);
@@ -404,14 +459,22 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         // Do the volume changing separately to give responsive UI
         mLastProgress = progress;
         mHandler.removeMessages(MSG_SET_STREAM_VOLUME);
-        mHandler.sendMessage(mHandler.obtainMessage(MSG_SET_STREAM_VOLUME));
+        mHandler.removeMessages(MSG_START_SAMPLE);
+        mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_SET_STREAM_VOLUME),
+                isDelay() ? SET_STREAM_VOLUME_DELAY_MS : 0);
     }
 
     public void onStartTrackingTouch(SeekBar seekBar) {
+        if (mCallback != null) {
+            mCallback.onStartTrackingTouch(this);
+        }
     }
 
     public void onStopTrackingTouch(SeekBar seekBar) {
         postStartSample();
+        if (mCallback != null) {
+            mCallback.onStopTrackingTouch(this);
+        }
     }
 
     public boolean isSamplePlaying() {
@@ -490,7 +553,8 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         }
 
         public void postUpdateSlider(int volume, int lastAudibleVolume, boolean mute) {
-            obtainMessage(UPDATE_SLIDER, volume, lastAudibleVolume, new Boolean(mute)).sendToTarget();
+            obtainMessage(UPDATE_SLIDER, volume, lastAudibleVolume, Boolean.valueOf(mute))
+                    .sendToTarget();
         }
     }
 
@@ -539,7 +603,7 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
             if (AudioManager.VOLUME_CHANGED_ACTION.equals(action)) {
                 int streamType = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
                 int streamValue = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_VALUE, -1);
-                if (hasAudioProductStrategies()) {
+                if (hasAudioProductStrategies() && !isDelay()) {
                     updateVolumeSlider(streamType, streamValue);
                 }
             } else if (AudioManager.INTERNAL_RINGER_MODE_CHANGED_ACTION.equals(action)) {
@@ -551,7 +615,7 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
                 }
             } else if (AudioManager.STREAM_DEVICES_CHANGED_ACTION.equals(action)) {
                 int streamType = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
-                if (hasAudioProductStrategies()) {
+                if (hasAudioProductStrategies() && !isDelay()) {
                     int streamVolume = mAudioManager.getStreamVolume(streamType);
                     updateVolumeSlider(streamType, streamVolume);
                 } else {
@@ -559,7 +623,9 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
                     if (volumeGroup != AudioVolumeGroup.DEFAULT_VOLUME_GROUP
                             && volumeGroup == mVolumeGroupId) {
                         int streamVolume = mAudioManager.getStreamVolume(streamType);
-                        updateVolumeSlider(streamType, streamVolume);
+                        if (!isDelay()) {
+                            updateVolumeSlider(streamType, streamVolume);
+                        }
                     }
                 }
             } else if (NotificationManager.ACTION_INTERRUPTION_FILTER_CHANGED.equals(action)) {
@@ -578,8 +644,8 @@ public class SeekBarVolumizer implements OnSeekBarChangeListener, Handler.Callba
         }
 
         private void updateVolumeSlider(int streamType, int streamValue) {
-            final boolean streamMatch = mNotificationOrRing ? isNotificationOrRing(streamType)
-                    : (streamType == mStreamType);
+            final boolean streamMatch = mNotifAliasRing && mNotificationOrRing
+                    ? isNotificationOrRing(streamType) : streamType == mStreamType;
             if (mSeekBar != null && streamMatch && streamValue != -1) {
                 final boolean muted = mAudioManager.isStreamMute(mStreamType)
                         || streamValue == 0;

@@ -22,10 +22,9 @@ import com.android.systemui.statusbar.NotificationListener
 import com.android.systemui.statusbar.NotificationPresenter
 import com.android.systemui.statusbar.notification.NotificationActivityStarter
 import com.android.systemui.statusbar.notification.collection.inflation.NotificationRowBinderImpl
+import com.android.systemui.statusbar.notification.collection.render.NotifStackController
 import com.android.systemui.statusbar.notification.stack.NotificationListContainer
-import com.android.systemui.statusbar.phone.StatusBar
-import java.io.FileDescriptor
-import java.io.PrintWriter
+import com.android.systemui.statusbar.phone.CentralSurfaces
 import javax.inject.Inject
 
 /**
@@ -36,9 +35,10 @@ class NotificationsControllerStub @Inject constructor(
 ) : NotificationsController {
 
     override fun initialize(
-        statusBar: StatusBar,
+        centralSurfaces: CentralSurfaces,
         presenter: NotificationPresenter,
         listContainer: NotificationListContainer,
+        stackController: NotifStackController,
         notificationActivityStarter: NotificationActivityStarter,
         bindRowCallback: NotificationRowBinderImpl.BindRowCallback
     ) {
@@ -47,30 +47,13 @@ class NotificationsControllerStub @Inject constructor(
         notificationListener.registerAsSystemService()
     }
 
-    override fun requestNotificationUpdate(reason: String) {
-    }
-
     override fun resetUserExpandedStates() {
     }
 
     override fun setNotificationSnoozed(sbn: StatusBarNotification, snoozeOption: SnoozeOption) {
     }
 
-    override fun setNotificationSnoozed(sbn: StatusBarNotification, hoursToSnooze: Int) {
-    }
-
     override fun getActiveNotificationsCount(): Int {
         return 0
-    }
-
-    override fun dump(
-        fd: FileDescriptor,
-        pw: PrintWriter,
-        args: Array<String>,
-        dumpTruck: Boolean
-    ) {
-        pw.println()
-        pw.println("Notification handling disabled")
-        pw.println()
     }
 }

@@ -18,6 +18,8 @@ package com.android.server.display.color;
 
 import static com.android.server.display.color.DisplayTransformManager.LEVEL_COLOR_MATRIX_DISPLAY_WHITE_BALANCE;
 
+import android.annotation.NonNull;
+import android.annotation.Size;
 import android.content.Context;
 import android.content.res.Resources;
 import android.graphics.ColorSpace;
@@ -32,7 +34,6 @@ import com.android.internal.R;
 import com.android.internal.annotations.VisibleForTesting;
 
 import java.io.PrintWriter;
-import java.lang.System;
 
 final class DisplayWhiteBalanceTintController extends TintController {
 
@@ -60,11 +61,16 @@ final class DisplayWhiteBalanceTintController extends TintController {
     boolean mSetUp = false;
     private float[] mMatrixDisplayWhiteBalance = new float[16];
     private Boolean mIsAvailable;
+    // This feature becomes disallowed if the device is in an unsupported strong/light state.
+    private boolean mIsAllowed = true;
 
     @Override
     public void setUp(Context context, boolean needsLinear) {
         mSetUp = false;
         final Resources res = context.getResources();
+
+        // Initialize with the config value for light mode, so it starts in the right state.
+        setAllowed(res.getBoolean(R.bool.config_displayWhiteBalanceLightModeAllowed));
 
         ColorSpace.Rgb displayColorSpaceRGB = getDisplayColorSpaceFromSurfaceControl();
         if (displayColorSpaceRGB == null) {
@@ -131,6 +137,30 @@ final class DisplayWhiteBalanceTintController extends TintController {
                 : ColorDisplayService.MATRIX_IDENTITY;
     }
 
+    /**
+     * Multiplies two 3x3 matrices, represented as non-null arrays of 9 floats.
+     *
+     * @param lhs 3x3 matrix, as a non-null array of 9 floats
+     * @param rhs 3x3 matrix, as a non-null array of 9 floats
+     * @return A new array of 9 floats containing the result of the multiplication
+     *         of rhs by lhs
+     */
+    @NonNull
+    @Size(9)
+    private static float[] mul3x3(@NonNull @Size(9) float[] lhs, @NonNull @Size(9) float[] rhs) {
+        float[] r = new float[9];
+        r[0] = lhs[0] * rhs[0] + lhs[3] * rhs[1] + lhs[6] * rhs[2];
+        r[1] = lhs[1] * rhs[0] + lhs[4] * rhs[1] + lhs[7] * rhs[2];
+        r[2] = lhs[2] * rhs[0] + lhs[5] * rhs[1] + lhs[8] * rhs[2];
+        r[3] = lhs[0] * rhs[3] + lhs[3] * rhs[4] + lhs[6] * rhs[5];
+        r[4] = lhs[1] * rhs[3] + lhs[4] * rhs[4] + lhs[7] * rhs[5];
+        r[5] = lhs[2] * rhs[3] + lhs[5] * rhs[4] + lhs[8] * rhs[5];
+        r[6] = lhs[0] * rhs[6] + lhs[3] * rhs[7] + lhs[6] * rhs[8];
+        r[7] = lhs[1] * rhs[6] + lhs[4] * rhs[7] + lhs[7] * rhs[8];
+        r[8] = lhs[2] * rhs[6] + lhs[5] * rhs[7] + lhs[8] * rhs[8];
+        return r;
+    }
+
     @Override
     public void setMatrix(int cct) {
         if (!mSetUp) {
@@ -160,9 +190,9 @@ final class DisplayWhiteBalanceTintController extends TintController {
                             mDisplayNominalWhiteXYZ, mCurrentColorTemperatureXYZ);
 
             // Convert the adaptation matrix to RGB space
-            float[] result = ColorSpace.mul3x3(mChromaticAdaptationMatrix,
+            float[] result = mul3x3(mChromaticAdaptationMatrix,
                     mDisplayColorSpaceRGB.getTransform());
-            result = ColorSpace.mul3x3(mDisplayColorSpaceRGB.getInverseTransform(), result);
+            result = mul3x3(mDisplayColorSpaceRGB.getInverseTransform(), result);
 
             // Normalize the transform matrix to peak white value in RGB space
             final float adaptedMaxR = result[0] + result[3] + result[6];
@@ -223,7 +253,28 @@ final class DisplayWhiteBalanceTintController extends TintController {
                     + matrixToString(mDisplayColorSpaceRGB.getInverseTransform(), 3));
             pw.println("    mMatrixDisplayWhiteBalance = "
                     + matrixToString(mMatrixDisplayWhiteBalance, 4));
+            pw.println("    mIsAllowed = " + mIsAllowed);
         }
+    }
+
+    public float getLuminance() {
+        synchronized (mLock) {
+            if (mChromaticAdaptationMatrix != null && mChromaticAdaptationMatrix.length == 9) {
+                // Compute only the luminance (y) value of the xyz * [1 1 1] transform.
+                return 1 / (mChromaticAdaptationMatrix[1] + mChromaticAdaptationMatrix[4]
+                        + mChromaticAdaptationMatrix[7]);
+            } else {
+                return -1;
+            }
+        }
+    }
+
+    public void setAllowed(boolean allowed) {
+        mIsAllowed = allowed;
+    }
+
+    public boolean isAllowed() {
+        return mIsAllowed;
     }
 
     private ColorSpace.Rgb makeRgbColorSpaceFromXYZ(float[] redGreenBlueXYZ, float[] whiteXYZ) {

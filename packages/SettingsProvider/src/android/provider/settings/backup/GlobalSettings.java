@@ -49,6 +49,7 @@ public class GlobalSettings {
         Settings.Global.CHARGING_SOUNDS_ENABLED,
         Settings.Global.USB_MASS_STORAGE_ENABLED,
         Settings.Global.NETWORK_RECOMMENDATIONS_ENABLED,
+        Settings.Global.NETWORK_AVOID_BAD_WIFI,
         Settings.Global.WIFI_WAKEUP_ENABLED,
         Settings.Global.WIFI_NETWORKS_AVAILABLE_NOTIFICATION_ON,
         Settings.Global.USE_OPEN_WIFI_PACKAGE,
@@ -69,9 +70,20 @@ public class GlobalSettings {
         Settings.Global.ZEN_DURATION,
         Settings.Global.CHARGING_VIBRATION_ENABLED,
         Settings.Global.AWARE_ALLOWED,
-        Settings.Global.NOTIFICATION_BUBBLES,
         Settings.Global.CUSTOM_BUGREPORT_HANDLER_APP,
         Settings.Global.CUSTOM_BUGREPORT_HANDLER_USER,
-        Settings.Global.DEVELOPMENT_SETTINGS_ENABLED
+        Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
+        Settings.Global.USER_DISABLED_HDR_FORMATS,
+        Settings.Global.ARE_USER_DISABLED_HDR_FORMATS_ALLOWED,
+        Settings.Global.DEVICE_CONFIG_SYNC_DISABLED,
+        Settings.Global.POWER_BUTTON_LONG_PRESS,
+        Settings.Global.AUTOMATIC_POWER_SAVE_MODE,
+        Settings.Global.ADVANCED_BATTERY_USAGE_AMOUNT,
+        Settings.Global.ADAPTIVE_BATTERY_MANAGEMENT_ENABLED,
+        Settings.Global.POWER_BUTTON_LONG_PRESS_DURATION_MS,
+        Settings.Global.USER_PREFERRED_REFRESH_RATE,
+        Settings.Global.USER_PREFERRED_RESOLUTION_HEIGHT,
+        Settings.Global.USER_PREFERRED_RESOLUTION_WIDTH,
+        Settings.Global.POWER_BUTTON_LONG_PRESS
     };
 }

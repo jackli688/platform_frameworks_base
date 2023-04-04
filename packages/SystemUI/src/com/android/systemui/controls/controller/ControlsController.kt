@@ -24,6 +24,7 @@ import com.android.systemui.controls.ControlStatus
 import com.android.systemui.util.UserAwareController
 import com.android.systemui.controls.management.ControlsFavoritingActivity
 import com.android.systemui.controls.ui.ControlsUiController
+import com.android.systemui.controls.ui.SelectedItem
 import java.util.function.Consumer
 
 /**
@@ -39,11 +40,6 @@ import java.util.function.Consumer
  *  information for the current user only.
  */
 interface ControlsController : UserAwareController {
-
-    /**
-     * Whether the controls system is available for the current user.
-     */
-    val available: Boolean
 
     // SERVICE COMMUNICATION
 
@@ -188,6 +184,9 @@ interface ControlsController : UserAwareController {
      * @return the number of current favorites for the given component
      */
     fun countFavoritesForComponent(componentName: ComponentName): Int
+
+    /** See [ControlsUiController.getPreferredSelectedItem]. */
+    fun getPreferredSelection(): SelectedItem
 
     /**
      * Interface for structure to pass data to [ControlsFavoritingActivity].

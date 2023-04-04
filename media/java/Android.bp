@@ -8,6 +8,20 @@ package {
 }
 
 filegroup {
+    name: "framework-media-non-updatable-sources",
+    srcs: [
+        "**/*.java",
+        "**/*.aidl",
+    ],
+    exclude_srcs: [
+        ":framework-media-tv-tunerresourcemanager-sources-aidl",
+    ],
+    visibility: [
+        "//frameworks/base",
+    ],
+}
+
+filegroup {
     name: "IMidiDeviceServer.aidl",
     srcs: ["android/media/midi/IMidiDeviceServer.aidl"],
 }

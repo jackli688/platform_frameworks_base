@@ -29,6 +29,7 @@ import android.provider.Settings;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.SpannedString;
+import android.text.TextUtils;
 
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
@@ -169,7 +170,7 @@ public class DateFormat {
      * mean using 12-hour in some locales and, in this case, is duplicated as the 'a' field.
      */
     @ChangeId
-    @EnabledSince(targetSdkVersion = Build.VERSION_CODES.CUR_DEVELOPMENT)
+    @EnabledSince(targetSdkVersion = Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     static final long DISALLOW_DUPLICATE_FIELD_IN_SKELETON = 170233598L;
 
     /**
@@ -267,7 +268,8 @@ public class DateFormat {
         DateTimePatternGenerator dtpg = DateTimePatternGenerator.getInstance(locale);
         boolean allowDuplicateFields = !CompatChanges.isChangeEnabled(
                 DISALLOW_DUPLICATE_FIELD_IN_SKELETON);
-        return dtpg.getBestPattern(skeleton, allowDuplicateFields);
+        return dtpg.getBestPattern(skeleton, DateTimePatternGenerator.MATCH_NO_OPTIONS,
+                allowDuplicateFields);
     }
 
     /**

@@ -24,10 +24,7 @@ import static junit.framework.TestCase.fail;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -47,14 +44,10 @@ import androidx.test.filters.SmallTest;
 
 import com.android.internal.messages.nano.SystemMessageProto;
 import com.android.systemui.appops.AppOpsController;
-import com.android.systemui.statusbar.notification.NotificationEntryListener;
-import com.android.systemui.statusbar.notification.NotificationEntryManager;
 import com.android.systemui.statusbar.notification.collection.NotifPipeline;
 import com.android.systemui.statusbar.notification.collection.NotificationEntry;
 import com.android.systemui.statusbar.notification.collection.NotificationEntryBuilder;
-import com.android.systemui.util.time.FakeSystemClock;
-
-import junit.framework.Assert;
+import com.android.systemui.statusbar.notification.collection.notifcollection.NotifCollectionListener;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -69,9 +62,7 @@ import org.mockito.MockitoAnnotations;
 public class ForegroundServiceControllerTest extends SysuiTestCase {
     private ForegroundServiceController mFsc;
     private ForegroundServiceNotificationListener mListener;
-    private NotificationEntryListener mEntryListener;
-    private final FakeSystemClock mClock = new FakeSystemClock();
-    @Mock private NotificationEntryManager mEntryManager;
+    private NotifCollectionListener mCollectionListener;
     @Mock private AppOpsController mAppOpsController;
     @Mock private Handler mMainHandler;
     @Mock private NotifPipeline mNotifPipeline;
@@ -82,16 +73,15 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
         allowTestableLooperAsMainThread();
 
         MockitoAnnotations.initMocks(this);
-        mFsc = new ForegroundServiceController(
-                mEntryManager, mAppOpsController, mMainHandler);
+        mFsc = new ForegroundServiceController(mAppOpsController, mMainHandler);
         mListener = new ForegroundServiceNotificationListener(
-                mContext, mFsc, mEntryManager, mNotifPipeline,
-                mock(ForegroundServiceLifetimeExtender.class), mClock);
-        ArgumentCaptor<NotificationEntryListener> entryListenerCaptor =
-                ArgumentCaptor.forClass(NotificationEntryListener.class);
-        verify(mEntryManager).addNotificationEntryListener(
+                mContext, mFsc, mNotifPipeline);
+        mListener.init();
+        ArgumentCaptor<NotifCollectionListener> entryListenerCaptor =
+                ArgumentCaptor.forClass(NotifCollectionListener.class);
+        verify(mNotifPipeline).addCollectionListener(
                 entryListenerCaptor.capture());
-        mEntryListener = entryListenerCaptor.getValue();
+        mCollectionListener = entryListenerCaptor.getValue();
     }
 
     @Test
@@ -112,85 +102,6 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
         } catch (IllegalStateException e) {
             // THEN expect an exception
         }
-    }
-
-    @Test
-    public void testAppOps_appOpChangedBeforeNotificationExists() {
-        // GIVEN app op exists, but notification doesn't exist in NEM yet
-        NotificationEntry entry = createFgEntry();
-        mFsc.onAppOpChanged(
-                AppOpsManager.OP_CAMERA,
-                entry.getSbn().getUid(),
-                entry.getSbn().getPackageName(),
-                true);
-        assertFalse(entry.mActiveAppOps.contains(AppOpsManager.OP_CAMERA));
-
-        // WHEN the notification is added
-        mEntryListener.onPendingEntryAdded(entry);
-
-        // THEN the app op is added to the entry
-        Assert.assertTrue(entry.mActiveAppOps.contains(AppOpsManager.OP_CAMERA));
-    }
-
-    @Test
-    public void testAppOps_appOpAddedToForegroundNotif() {
-        // GIVEN a notification associated with a foreground service
-        NotificationEntry entry = addFgEntry();
-        when(mEntryManager.getPendingOrActiveNotif(entry.getKey())).thenReturn(entry);
-
-        // WHEN we are notified of a new app op for this notification
-        mFsc.onAppOpChanged(
-                AppOpsManager.OP_CAMERA,
-                entry.getSbn().getUid(),
-                entry.getSbn().getPackageName(),
-                true);
-
-        // THEN the app op is added to the entry
-        Assert.assertTrue(entry.mActiveAppOps.contains(AppOpsManager.OP_CAMERA));
-
-        // THEN notification views are updated since the notification is visible
-        verify(mEntryManager, times(1)).updateNotifications(anyString());
-    }
-
-    @Test
-    public void testAppOpsAlreadyAdded() {
-        // GIVEN a foreground service associated notification that already has the correct app op
-        NotificationEntry entry = addFgEntry();
-        entry.mActiveAppOps.add(AppOpsManager.OP_CAMERA);
-        when(mEntryManager.getPendingOrActiveNotif(entry.getKey())).thenReturn(entry);
-
-        // WHEN we are notified of the same app op for this notification
-        mFsc.onAppOpChanged(
-                AppOpsManager.OP_CAMERA,
-                entry.getSbn().getUid(),
-                entry.getSbn().getPackageName(),
-                true);
-
-        // THEN the app op still exists in the notification entry
-        Assert.assertTrue(entry.mActiveAppOps.contains(AppOpsManager.OP_CAMERA));
-
-        // THEN notification views aren't updated since nothing changed
-        verify(mEntryManager, never()).updateNotifications(anyString());
-    }
-
-    @Test
-    public void testAppOps_appOpNotAddedToUnrelatedNotif() {
-        // GIVEN no notification entries correspond to the newly updated appOp
-        NotificationEntry entry = addFgEntry();
-        when(mEntryManager.getPendingOrActiveNotif(entry.getKey())).thenReturn(null);
-
-        // WHEN a new app op is detected
-        mFsc.onAppOpChanged(
-                AppOpsManager.OP_CAMERA,
-                entry.getSbn().getUid(),
-                entry.getSbn().getPackageName(),
-                true);
-
-        // THEN we won't see appOps on the entry
-        Assert.assertFalse(entry.mActiveAppOps.contains(AppOpsManager.OP_CAMERA));
-
-        // THEN notification views aren't updated since nothing changed
-        verify(mEntryManager, never()).updateNotifications(anyString());
     }
 
     @Test
@@ -395,17 +306,6 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
     }
 
     @Test
-    public void testOverlayPredicate() {
-        StatusBarNotification sbn_user1_app1 = makeMockSBN(USERID_ONE, "com.example.app1",
-                5000, "monkeys", Notification.FLAG_AUTO_CANCEL);
-        StatusBarNotification sbn_user1_overlay = makeMockSBN(USERID_ONE, "android",
-                0, "AlertWindowNotification", Notification.FLAG_NO_CLEAR);
-
-        assertTrue(mFsc.isSystemAlertNotification(sbn_user1_overlay));
-        assertFalse(mFsc.isSystemAlertNotification(sbn_user1_app1));
-    }
-
-    @Test
     public void testNoNotifsNorAppOps_noSystemAlertWarningRequired() {
         // no notifications nor app op signals that this package/userId requires system alert
         // warning
@@ -546,7 +446,7 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
 
     private NotificationEntry addFgEntry() {
         NotificationEntry entry = createFgEntry();
-        mEntryListener.onPendingEntryAdded(entry);
+        mCollectionListener.onEntryAdded(entry);
         return entry;
     }
 
@@ -558,12 +458,10 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
     }
 
     private void entryRemoved(StatusBarNotification notification) {
-        mEntryListener.onEntryRemoved(
+        mCollectionListener.onEntryRemoved(
                 new NotificationEntryBuilder()
                         .setSbn(notification)
                         .build(),
-                null,
-                false,
                 REASON_APP_CANCEL);
     }
 
@@ -572,7 +470,7 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
                 .setSbn(notification)
                 .setImportance(importance)
                 .build();
-        mEntryListener.onPendingEntryAdded(entry);
+        mCollectionListener.onEntryAdded(entry);
     }
 
     private void entryUpdated(StatusBarNotification notification, int importance) {
@@ -580,7 +478,7 @@ public class ForegroundServiceControllerTest extends SysuiTestCase {
                 .setSbn(notification)
                 .setImportance(importance)
                 .build();
-        mEntryListener.onPreEntryUpdated(entry);
+        mCollectionListener.onEntryUpdated(entry);
     }
 
     @UserIdInt private static final int USERID_ONE = 10; // UserManagerService.MIN_USER_ID;

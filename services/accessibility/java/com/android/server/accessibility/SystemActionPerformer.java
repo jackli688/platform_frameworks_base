@@ -16,8 +16,6 @@
 
 package com.android.server.accessibility;
 
-import static android.view.WindowManager.ScreenshotSource.SCREENSHOT_ACCESSIBILITY_ACTIONS;
-
 import android.accessibilityservice.AccessibilityService;
 import android.app.PendingIntent;
 import android.app.RemoteAction;
@@ -34,6 +32,7 @@ import android.util.Slog;
 import android.view.InputDevice;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 
 import com.android.internal.R;
@@ -288,14 +287,27 @@ public class SystemActionPerformer {
                     showGlobalActions();
                     return true;
                 }
-                case AccessibilityService.GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN:
-                    return toggleSplitScreen();
                 case AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN:
                     return lockScreen();
                 case AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT:
                     return takeScreenshot();
                 case AccessibilityService.GLOBAL_ACTION_KEYCODE_HEADSETHOOK :
                     sendDownAndUpKeyEvents(KeyEvent.KEYCODE_HEADSETHOOK);
+                    return true;
+                case AccessibilityService.GLOBAL_ACTION_DPAD_UP:
+                    sendDownAndUpKeyEvents(KeyEvent.KEYCODE_DPAD_UP);
+                    return true;
+                case AccessibilityService.GLOBAL_ACTION_DPAD_DOWN:
+                    sendDownAndUpKeyEvents(KeyEvent.KEYCODE_DPAD_DOWN);
+                    return true;
+                case AccessibilityService.GLOBAL_ACTION_DPAD_LEFT:
+                    sendDownAndUpKeyEvents(KeyEvent.KEYCODE_DPAD_LEFT);
+                    return true;
+                case AccessibilityService.GLOBAL_ACTION_DPAD_RIGHT:
+                    sendDownAndUpKeyEvents(KeyEvent.KEYCODE_DPAD_RIGHT);
+                    return true;
+                case AccessibilityService.GLOBAL_ACTION_DPAD_CENTER:
+                    sendDownAndUpKeyEvents(KeyEvent.KEYCODE_DPAD_CENTER);
                     return true;
                 default:
                     Slog.e(TAG, "Invalid action id: " + actionId);
@@ -308,14 +320,15 @@ public class SystemActionPerformer {
 
     private void sendDownAndUpKeyEvents(int keyCode) {
         final long token = Binder.clearCallingIdentity();
-
-        // Inject down.
-        final long downTime = SystemClock.uptimeMillis();
-        sendKeyEventIdentityCleared(keyCode, KeyEvent.ACTION_DOWN, downTime, downTime);
-        sendKeyEventIdentityCleared(
-                keyCode, KeyEvent.ACTION_UP, downTime, SystemClock.uptimeMillis());
-
-        Binder.restoreCallingIdentity(token);
+        try {
+            // Inject down.
+            final long downTime = SystemClock.uptimeMillis();
+            sendKeyEventIdentityCleared(keyCode, KeyEvent.ACTION_DOWN, downTime, downTime);
+            sendKeyEventIdentityCleared(
+                    keyCode, KeyEvent.ACTION_UP, downTime, SystemClock.uptimeMillis());
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private void sendKeyEventIdentityCleared(int keyCode, int action, long downTime, long time) {
@@ -329,22 +342,24 @@ public class SystemActionPerformer {
 
     private void expandNotifications() {
         final long token = Binder.clearCallingIdentity();
-
-        StatusBarManager statusBarManager = (StatusBarManager) mContext.getSystemService(
-                android.app.Service.STATUS_BAR_SERVICE);
-        statusBarManager.expandNotificationsPanel();
-
-        Binder.restoreCallingIdentity(token);
+        try {
+            StatusBarManager statusBarManager = (StatusBarManager) mContext.getSystemService(
+                    android.app.Service.STATUS_BAR_SERVICE);
+            statusBarManager.expandNotificationsPanel();
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private void expandQuickSettings() {
         final long token = Binder.clearCallingIdentity();
-
-        StatusBarManager statusBarManager = (StatusBarManager) mContext.getSystemService(
-                android.app.Service.STATUS_BAR_SERVICE);
-        statusBarManager.expandSettingsPanel();
-
-        Binder.restoreCallingIdentity(token);
+        try {
+            StatusBarManager statusBarManager = (StatusBarManager) mContext.getSystemService(
+                    android.app.Service.STATUS_BAR_SERVICE);
+            statusBarManager.expandSettingsPanel();
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     private boolean openRecents() {
@@ -366,21 +381,6 @@ public class SystemActionPerformer {
         mWindowManagerService.showGlobalActions();
     }
 
-    private boolean toggleSplitScreen() {
-        final long token = Binder.clearCallingIdentity();
-        try {
-            StatusBarManagerInternal statusBarService = LocalServices.getService(
-                    StatusBarManagerInternal.class);
-            if (statusBarService == null) {
-                return false;
-            }
-            statusBarService.toggleSplitScreen();
-        } finally {
-            Binder.restoreCallingIdentity(token);
-        }
-        return true;
-    }
-
     private boolean lockScreen() {
         mContext.getSystemService(PowerManager.class).goToSleep(SystemClock.uptimeMillis(),
                 PowerManager.GO_TO_SLEEP_REASON_ACCESSIBILITY, 0);
@@ -391,8 +391,8 @@ public class SystemActionPerformer {
     private boolean takeScreenshot() {
         ScreenshotHelper screenshotHelper = (mScreenshotHelperSupplier != null)
                 ? mScreenshotHelperSupplier.get() : new ScreenshotHelper(mContext);
-        screenshotHelper.takeScreenshot(android.view.WindowManager.TAKE_SCREENSHOT_FULLSCREEN,
-                true, true, SCREENSHOT_ACCESSIBILITY_ACTIONS,
+        screenshotHelper.takeScreenshot(WindowManager.TAKE_SCREENSHOT_FULLSCREEN,
+                WindowManager.ScreenshotSource.SCREENSHOT_ACCESSIBILITY_ACTIONS,
                 new Handler(Looper.getMainLooper()), null);
         return true;
     }

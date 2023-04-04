@@ -16,6 +16,14 @@
 
 package android.os;
 
+import android.net.Network;
+
+import com.android.internal.os.BinderCallsStats;
+import com.android.internal.os.SystemServerCpuThreadReader.SystemServiceCpuThreadTimes;
+
+import java.util.Collection;
+import java.util.List;
+
 /**
  * Battery stats local system service interface. This is used to pass internal data out of
  * BatteryStatsImpl, as well as make unchecked calls into BatteryStatsImpl.
@@ -33,6 +41,20 @@ public abstract class BatteryStatsInternal {
      */
     public abstract String[] getMobileIfaces();
 
+    /** Returns CPU times for system server thread groups. */
+    public abstract SystemServiceCpuThreadTimes getSystemServiceCpuThreadTimes();
+
+    /**
+     * Returns BatteryUsageStats, which contains power attribution data on a per-subsystem
+     * and per-UID basis.
+     *
+     * <p>
+     * Note: This is a slow running method and should be called from non-blocking threads only.
+     * </p>
+     */
+    public abstract List<BatteryUsageStats> getBatteryUsageStats(
+            List<BatteryUsageStatsQuery> queries);
+
     /**
      * Inform battery stats how many deferred jobs existed when the app got launched and how
      * long ago was the last job execution for the app.
@@ -41,4 +63,24 @@ public abstract class BatteryStatsInternal {
      * @param sinceLast how long in millis has it been since a job was run
      */
     public abstract void noteJobsDeferred(int uid, int numDeferred, long sinceLast);
+
+    /**
+     * Informs battery stats of a data packet that woke up the CPU.
+     *
+     * @param network The network over which the packet arrived.
+     * @param elapsedMillis The time of the packet's arrival in elapsed timebase.
+     * @param uid The uid that received the packet.
+     */
+    public abstract void noteCpuWakingNetworkPacket(Network network, long elapsedMillis, int uid);
+
+    /**
+     * Informs battery stats of binder stats for the given work source UID.
+     */
+    public abstract void noteBinderCallStats(int workSourceUid, long incrementalBinderCallCount,
+            Collection<BinderCallsStats.CallStat> callStats);
+
+    /**
+     * Informs battery stats of native thread IDs of threads taking incoming binder calls.
+     */
+    public abstract void noteBinderThreadNativeIds(int[] binderThreadNativeTids);
 }

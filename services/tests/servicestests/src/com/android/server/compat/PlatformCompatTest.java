@@ -98,7 +98,7 @@ public class PlatformCompatTest {
                 .addEnableAfterSdkChangeWithId(Build.VERSION_CODES.Q, 5L)
                 .addEnableAfterSdkChangeWithId(Build.VERSION_CODES.R, 6L)
                 .addLoggingOnlyChangeWithId(7L)
-                .addOverridableChangeWithId(8L)
+                .addDisabledOverridableChangeWithId(8L)
                 .build();
         mPlatformCompat = new PlatformCompat(mContext, mCompatConfig, mBuildClassifier);
         assertThat(mPlatformCompat.listAllChanges()).asList().containsExactly(
@@ -113,7 +113,7 @@ public class PlatformCompatTest {
                 new CompatibilityChangeInfo(
                         6L, "", Build.VERSION_CODES.R, -1, false, false, "", false),
                 new CompatibilityChangeInfo(7L, "", -1, -1, false, true, "", false),
-                new CompatibilityChangeInfo(8L, "", -1, -1, false, true, "", true));
+                new CompatibilityChangeInfo(8L, "", -1, -1, true, false, "", true));
     }
 
     @Test

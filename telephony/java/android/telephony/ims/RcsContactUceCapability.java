@@ -29,7 +29,9 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Contains the User Capability Exchange capabilities corresponding to a contact's URI.
@@ -110,7 +112,6 @@ public final class RcsContactUceCapability implements Parcelable {
     /**
      * Builder to help construct {@link RcsContactUceCapability} instances when capabilities were
      * queried through SIP OPTIONS.
-     * @hide
      */
     public static final class OptionsBuilder {
 
@@ -124,6 +125,18 @@ public final class RcsContactUceCapability implements Parcelable {
         public OptionsBuilder(@NonNull Uri contact) {
             mCapabilities = new RcsContactUceCapability(contact, CAPABILITY_MECHANISM_OPTIONS,
                     SOURCE_TYPE_NETWORK);
+        }
+
+        /**
+         * Create the Builder, which can be used to set UCE capabilities as well as custom
+         * capability extensions.
+         * @param contact The contact URI that the capabilities are attached to.
+         * @param sourceType The type where the capabilities of this contact were retrieved from.
+         * @hide
+         */
+        public OptionsBuilder(@NonNull Uri contact, @SourceType int sourceType) {
+            mCapabilities = new RcsContactUceCapability(contact, CAPABILITY_MECHANISM_OPTIONS,
+                    sourceType);
         }
 
         /**
@@ -151,7 +164,7 @@ public final class RcsContactUceCapability implements Parcelable {
          * @param tags the list of the supported feature tags
          * @return this OptionBuilder
          */
-        public @NonNull OptionsBuilder addFeatureTags(@NonNull List<String> tags) {
+        public @NonNull OptionsBuilder addFeatureTags(@NonNull Set<String> tags) {
             mCapabilities.mFeatureTags.addAll(tags);
             return this;
         }
@@ -208,6 +221,15 @@ public final class RcsContactUceCapability implements Parcelable {
         }
 
         /**
+         * Set the entity URI related to the contact whose capabilities were requested.
+         * @param entityUri the 'pres' URL of the PRESENTITY publishing presence document.
+         */
+        public @NonNull PresenceBuilder setEntityUri(@NonNull Uri entityUri) {
+            mCapabilities.mEntityUri = entityUri;
+            return this;
+        }
+
+        /**
          * @return the RcsContactUceCapability instance.
          */
         public @NonNull RcsContactUceCapability build() {
@@ -219,8 +241,9 @@ public final class RcsContactUceCapability implements Parcelable {
     private @SourceType int mSourceType;
     private @CapabilityMechanism int mCapabilityMechanism;
     private @RequestResult int mRequestResult;
+    private Uri mEntityUri;
 
-    private final List<String> mFeatureTags = new ArrayList<>();
+    private final Set<String> mFeatureTags = new HashSet<>();
     private final List<RcsContactPresenceTuple> mPresenceTuples = new ArrayList<>();
 
     private RcsContactUceCapability(@NonNull Uri contactUri, @CapabilityMechanism int mechanism,
@@ -231,12 +254,15 @@ public final class RcsContactUceCapability implements Parcelable {
     }
 
     private RcsContactUceCapability(Parcel in) {
-        mContactUri = in.readParcelable(Uri.class.getClassLoader());
+        mContactUri = in.readParcelable(Uri.class.getClassLoader(), android.net.Uri.class);
         mCapabilityMechanism = in.readInt();
         mSourceType = in.readInt();
         mRequestResult = in.readInt();
-        in.readStringList(mFeatureTags);
-        in.readParcelableList(mPresenceTuples, RcsContactPresenceTuple.class.getClassLoader());
+        mEntityUri = in.readParcelable(Uri.class.getClassLoader(), android.net.Uri.class);
+        List<String> featureTagList = new ArrayList<>();
+        in.readStringList(featureTagList);
+        mFeatureTags.addAll(featureTagList);
+        in.readParcelableList(mPresenceTuples, RcsContactPresenceTuple.class.getClassLoader(), android.telephony.ims.RcsContactPresenceTuple.class);
     }
 
     @Override
@@ -245,7 +271,8 @@ public final class RcsContactUceCapability implements Parcelable {
         out.writeInt(mCapabilityMechanism);
         out.writeInt(mSourceType);
         out.writeInt(mRequestResult);
-        out.writeStringList(mFeatureTags);
+        out.writeParcelable(mEntityUri, flags);
+        out.writeStringList(new ArrayList<>(mFeatureTags));
         out.writeParcelableList(mPresenceTuples, flags);
     }
 
@@ -279,13 +306,12 @@ public final class RcsContactUceCapability implements Parcelable {
      * <p>
      * Note: this is only populated if {@link #getCapabilityMechanism} is
      * {@link RcsContactUceCapability#CAPABILITY_MECHANISM_OPTIONS}
-     * @hide
      */
-    public @NonNull List<String> getOptionsFeatureTags() {
+    public @NonNull Set<String> getFeatureTags() {
         if (mCapabilityMechanism != CAPABILITY_MECHANISM_OPTIONS) {
-            return Collections.emptyList();
+            return Collections.emptySet();
         }
-        return Collections.unmodifiableList(mFeatureTags);
+        return Collections.unmodifiableSet(mFeatureTags);
     }
 
     /**
@@ -317,7 +343,7 @@ public final class RcsContactUceCapability implements Parcelable {
             return null;
         }
         for (RcsContactPresenceTuple tuple : mPresenceTuples) {
-            if (tuple.getServiceId().equals(serviceId)) {
+            if (tuple.getServiceId() != null && tuple.getServiceId().equals(serviceId)) {
                 return tuple;
             }
         }
@@ -347,6 +373,15 @@ public final class RcsContactUceCapability implements Parcelable {
         return mContactUri;
     }
 
+    /**
+     * Retrieve the entity URI of the contact whose presence information is being requested for.
+     * @return the URI representing the 'pres' URL of the PRESENTITY publishing presence document
+     * or {@code null} if the entity uri does not exist in the presence document.
+     */
+    public @Nullable Uri getEntityUri() {
+        return mEntityUri;
+    }
+
     @Override
     public String toString() {
         StringBuilder builder = new StringBuilder("RcsContactUceCapability");
@@ -368,6 +403,13 @@ public final class RcsContactUceCapability implements Parcelable {
         builder.append(mSourceType);
         builder.append(", requestResult=");
         builder.append(mRequestResult);
+        if (Build.IS_ENG) {
+            builder.append("entity uri=");
+            builder.append(mEntityUri != null ? mEntityUri : "null");
+        } else {
+            builder.append("entity uri (isNull)=");
+            builder.append(mEntityUri != null ? "XXX" : "null");
+        }
 
         if (mCapabilityMechanism == CAPABILITY_MECHANISM_PRESENCE) {
             builder.append(", presenceTuples={");

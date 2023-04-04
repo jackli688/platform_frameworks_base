@@ -16,9 +16,10 @@
 
 package com.android.server.notification;
 
+import static android.service.notification.NotificationListenerService.REASON_ASSISTANT_CANCEL;
 import static android.service.notification.NotificationListenerService.REASON_CANCEL;
+import static android.service.notification.NotificationListenerService.REASON_CLEAR_DATA;
 import static android.service.notification.NotificationListenerService.REASON_CLICK;
-import static android.service.notification.NotificationListenerService.REASON_TIMEOUT;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
@@ -55,6 +56,20 @@ public interface NotificationRecordLogger {
      */
     void maybeLogNotificationPosted(@Nullable NotificationRecord r,
             @Nullable NotificationRecord old,
+            int position, int buzzBeepBlink,
+            InstanceId groupId);
+
+    /**
+     * Logs a NotificationReported atom reflecting an adjustment to a notification.
+     * Unlike maybeLogNotificationPosted, this method is guaranteed to log a notification update,
+     * so the caller must take responsibility for checking that that logging update is necessary,
+     * and that the notification is meaningfully changed.
+     * @param r The NotificationRecord. If null, no action is taken.
+     * @param position The position at which this notification is ranked.
+     * @param buzzBeepBlink Logging code reflecting whether this notification alerted the user.
+     * @param groupId The instance Id of the group summary notification, or null.
+     */
+    void logNotificationAdjusted(@Nullable NotificationRecord r,
             int position, int buzzBeepBlink,
             InstanceId groupId);
 
@@ -96,7 +111,9 @@ public interface NotificationRecordLogger {
         @UiEvent(doc = "New notification enqueued to post")
         NOTIFICATION_POSTED(162),
         @UiEvent(doc = "Notification substantially updated, or alerted again.")
-        NOTIFICATION_UPDATED(163);
+        NOTIFICATION_UPDATED(163),
+        @UiEvent(doc = "Notification adjusted by assistant.")
+        NOTIFICATION_ADJUSTED(908);
 
         private final int mId;
         NotificationReportedEvent(int id) {
@@ -155,16 +172,25 @@ public interface NotificationRecordLogger {
         NOTIFICATION_CANCEL_SNOOZED(181),
         @UiEvent(doc = "Notification was canceled due to timeout")
         NOTIFICATION_CANCEL_TIMEOUT(182),
-        // Values 183-189 reserved for future system dismissal reasons
+        @UiEvent(doc = "Notification was canceled due to the backing channel being deleted")
+        NOTIFICATION_CANCEL_CHANNEL_REMOVED(1261),
+        @UiEvent(doc = "Notification was canceled due to the app's storage being cleared")
+        NOTIFICATION_CANCEL_CLEAR_DATA(1262),
+        // Values above this line must remain in the same order as the corresponding
+        // NotificationCancelReason enum values.
         @UiEvent(doc = "Notification was canceled due to user dismissal of a peeking notification.")
         NOTIFICATION_CANCEL_USER_PEEK(190),
         @UiEvent(doc = "Notification was canceled due to user dismissal from the always-on display")
         NOTIFICATION_CANCEL_USER_AOD(191),
+        @UiEvent(doc = "Notification was canceled due to user dismissal from a bubble")
+        NOTIFICATION_CANCEL_USER_BUBBLE(1228),
+        @UiEvent(doc = "Notification was canceled due to user dismissal from the lockscreen")
+        NOTIFICATION_CANCEL_USER_LOCKSCREEN(193),
         @UiEvent(doc = "Notification was canceled due to user dismissal from the notification"
                 + " shade.")
         NOTIFICATION_CANCEL_USER_SHADE(192),
-        @UiEvent(doc = "Notification was canceled due to user dismissal from the lockscreen")
-        NOTIFICATION_CANCEL_USER_LOCKSCREEN(193);
+        @UiEvent(doc = "Notification was canceled due to an assistant adjustment update.")
+        NOTIFICATION_CANCEL_ASSISTANT(906);
 
         private final int mId;
         NotificationCancelledEvent(int id) {
@@ -187,8 +213,11 @@ public interface NotificationRecordLogger {
             // Most cancel reasons do not have a meaningful surface. Reason codes map directly
             // to NotificationCancelledEvent codes.
             if (surface == NotificationStats.DISMISSAL_OTHER) {
-                if ((REASON_CLICK <= reason) && (reason <= REASON_TIMEOUT)) {
+                if ((REASON_CLICK <= reason) && (reason <= REASON_CLEAR_DATA)) {
                     return NotificationCancelledEvent.values()[reason];
+                }
+                if (reason == REASON_ASSISTANT_CANCEL) {
+                    return NotificationCancelledEvent.NOTIFICATION_CANCEL_ASSISTANT;
                 }
                 if (NotificationManagerService.DBG) {
                     throw new IllegalArgumentException("Unexpected cancel reason " + reason);
@@ -210,6 +239,10 @@ public interface NotificationRecordLogger {
                     return NOTIFICATION_CANCEL_USER_AOD;
                 case NotificationStats.DISMISSAL_SHADE:
                     return NOTIFICATION_CANCEL_USER_SHADE;
+                case NotificationStats.DISMISSAL_BUBBLE:
+                    return NOTIFICATION_CANCEL_USER_BUBBLE;
+                case NotificationStats.DISMISSAL_LOCKSCREEN:
+                    return NOTIFICATION_CANCEL_USER_LOCKSCREEN;
                 default:
                     if (NotificationManagerService.DBG) {
                         throw new IllegalArgumentException("Unexpected surface for user-dismiss "
@@ -349,7 +382,8 @@ public interface NotificationRecordLogger {
                     && Objects.equals(r.getSbn().getNotification().category,
                         old.getSbn().getNotification().category)
                     && (r.getImportance() == old.getImportance())
-                    && (getLoggingImportance(r) == getLoggingImportance(old)));
+                    && (getLoggingImportance(r) == getLoggingImportance(old))
+                    && r.rankingScoreMatches(old.getRankingScore()));
         }
 
         /**
@@ -429,4 +463,14 @@ public interface NotificationRecordLogger {
         return NotificationChannelLogger.getLoggingImportance(channel, importance);
     }
 
+    /**
+     * @param r NotificationRecord
+     * @return Whether the notification is a foreground service notification.
+     */
+    static boolean isForegroundService(@NonNull NotificationRecord r) {
+        if (r.getSbn() == null || r.getSbn().getNotification() == null) {
+            return false;
+        }
+        return (r.getSbn().getNotification().flags & Notification.FLAG_FOREGROUND_SERVICE) != 0;
+    }
 }

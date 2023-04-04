@@ -20,6 +20,7 @@ import android.graphics.Rect;
 import android.graphics.Region;
 import android.os.Bundle;
 import android.view.MotionEvent;
+import android.view.SurfaceControl;
 import com.android.systemui.shared.recents.ISystemUiProxy;
 
 oneway interface IOverviewProxy {
@@ -44,15 +45,10 @@ oneway interface IOverviewProxy {
     void onOverviewHidden(boolean triggeredFromAltTab, boolean triggeredFromHomeKey) = 8;
 
     /**
-     * Sent when there was an action on one of the onboarding tips view.
-     * TODO: Move this implementation to SystemUI completely
-     */
-    void onTip(int actionType, int viewType) = 10;
-
-    /**
      * Sent when device assistant changes its default assistant whether it is available or not.
+     * @param longPressHomeEnabled if 3-button nav assistant can be invoked or not
      */
-    void onAssistantAvailable(boolean available) = 13;
+    void onAssistantAvailable(boolean available, boolean longPressHomeEnabled) = 13;
 
     /**
      * Sent when the assistant changes how visible it is to the user.
@@ -60,19 +56,52 @@ oneway interface IOverviewProxy {
     void onAssistantVisibilityChanged(float visibility) = 14;
 
     /**
-     * Sent when back is triggered.
-     * TODO: Move this implementation to SystemUI completely
-     */
-    void onBackAction(boolean completed, int downX, int downY, boolean isButton,
-            boolean gestureSwipeLeft) = 15;
-
-    /**
      * Sent when some system ui state changes.
      */
     void onSystemUiStateChanged(int stateFlags) = 16;
 
     /**
-     * Sent when the split screen is resized
+     * Sent when suggested rotation button could be shown
      */
-    void onSplitScreenSecondaryBoundsChanged(in Rect bounds, in Rect insets) = 17;
+    void onRotationProposal(int rotation, boolean isValid) = 18;
+
+    /**
+     * Sent when disable flags change
+     */
+    void disable(int displayId, int state1, int state2, boolean animate) = 19;
+
+    /**
+     * Sent when behavior changes. See WindowInsetsController#@Behavior
+     */
+    void onSystemBarAttributesChanged(int displayId, int behavior) = 20;
+
+    /**
+     * Sent when screen turned on and ready to use (blocker scrim is hidden)
+     */
+    void onScreenTurnedOn() = 21;
+
+    /**
+     * Sent when the desired dark intensity of the nav buttons has changed
+     */
+    void onNavButtonsDarkIntensityChanged(float darkIntensity) = 22;
+
+     /**
+      * Sent when screen started turning on.
+      */
+     void onScreenTurningOn() = 23;
+
+     /**
+      * Sent when screen started turning off.
+      */
+     void onScreenTurningOff() = 24;
+
+     /**
+      * Sent when split keyboard shortcut is triggered to enter stage split.
+      */
+     void enterStageSplitFromRunningApp(boolean leftOrTop) = 25;
+
+     /**
+      * Sent when the surface for navigation bar is created or changed
+      */
+     void onNavigationBarSurface(in SurfaceControl surface) = 26;
 }

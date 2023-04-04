@@ -217,8 +217,10 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
      * frameworks/base/core/res/res/values/config.xml
      */
     public void addIgnoredSlot(String slotName) {
-        addIgnoredSlotInternal(slotName);
-        requestLayout();
+        boolean added = addIgnoredSlotInternal(slotName);
+        if (added) {
+            requestLayout();
+        }
     }
 
     /**
@@ -226,17 +228,27 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
      * @param slots names of the icons to ignore
      */
     public void addIgnoredSlots(List<String> slots) {
+        boolean willAddAny = false;
         for (String slot : slots) {
-            addIgnoredSlotInternal(slot);
+            willAddAny |= addIgnoredSlotInternal(slot);
         }
 
-        requestLayout();
+        if (willAddAny) {
+            requestLayout();
+        }
     }
 
-    private void addIgnoredSlotInternal(String slotName) {
-        if (!mIgnoredSlots.contains(slotName)) {
-            mIgnoredSlots.add(slotName);
+    /**
+     *
+     * @param slotName
+     * @return
+     */
+    private boolean addIgnoredSlotInternal(String slotName) {
+        if (mIgnoredSlots.contains(slotName)) {
+            return false;
         }
+        mIgnoredSlots.add(slotName);
+        return true;
     }
 
     /**
@@ -245,11 +257,26 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
      * @param slotName name of the icon slot to remove from the ignored list
      */
     public void removeIgnoredSlot(String slotName) {
-        if (mIgnoredSlots.contains(slotName)) {
-            mIgnoredSlots.remove(slotName);
+        boolean removed = mIgnoredSlots.remove(slotName);
+        if (removed) {
+            requestLayout();
+        }
+    }
+
+    /**
+     * Remove a list of slots from the list of ignored icon slots.
+     * It will then be shown when set to visible by the {@link StatusBarIconController}.
+     * @param slots name of the icon slots to remove from the ignored list
+     */
+    public void removeIgnoredSlots(List<String> slots) {
+        boolean removedAny = false;
+        for (String slot : slots) {
+            removedAny |= mIgnoredSlots.remove(slot);
         }
 
-        requestLayout();
+        if (removedAny) {
+            requestLayout();
+        }
     }
 
     /**
@@ -259,6 +286,25 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
     public void setIgnoredSlots(List<String> slots) {
         mIgnoredSlots.clear();
         addIgnoredSlots(slots);
+    }
+
+    /**
+     * Returns the view corresponding to a particular slot.
+     *
+     * Use it solely to manipulate how it is presented.
+     * @param slot name of the slot to find. Names are defined in
+     *            {@link com.android.internal.R.config_statusBarIcons}
+     * @return a view for the slot if this container has it, else {@code null}
+     */
+    public View getViewForSlot(String slot) {
+        for (int i = 0; i < getChildCount(); i++) {
+            View child = getChildAt(i);
+            if (child instanceof StatusIconDisplayable
+                    && ((StatusIconDisplayable) child).getSlot().equals(slot)) {
+                return child;
+            }
+        }
+        return null;
     }
 
     /**
@@ -291,7 +337,7 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
             // without cutting off the child view.
             translationX -= getViewTotalWidth(child);
             childState.visibleState = STATE_ICON;
-            childState.xTranslation = translationX;
+            childState.setXTranslation(translationX);
             mLayoutStates.add(0, childState);
 
             // Shift translationX over by mIconSpacing for the next view.
@@ -308,13 +354,13 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
         for (int i = totalVisible - 1; i >= 0; i--) {
             StatusIconState state = mLayoutStates.get(i);
             // Allow room for underflow if we found we need it in onMeasure
-            if (mNeedsUnderflow && (state.xTranslation < (contentStart + mUnderflowWidth))||
-                    (mShouldRestrictIcons && visible >= maxVisible)) {
+            if (mNeedsUnderflow && (state.getXTranslation() < (contentStart + mUnderflowWidth))
+                    || (mShouldRestrictIcons && (visible >= maxVisible))) {
                 firstUnderflowIndex = i;
                 break;
             }
             mUnderflowStart = (int) Math.max(
-                    contentStart, state.xTranslation - mUnderflowWidth - mIconSpacing);
+                    contentStart, state.getXTranslation() - mUnderflowWidth - mIconSpacing);
             visible++;
         }
 
@@ -325,7 +371,7 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
             for (int i = firstUnderflowIndex; i >= 0; i--) {
                 StatusIconState state = mLayoutStates.get(i);
                 if (totalDots < MAX_DOTS) {
-                    state.xTranslation = dotOffset;
+                    state.setXTranslation(dotOffset);
                     state.visibleState = STATE_DOT;
                     dotOffset -= dotWidth;
                     totalDots++;
@@ -340,7 +386,7 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
             for (int i = 0; i < childCount; i++) {
                 View child = getChildAt(i);
                 StatusIconState state = getViewStateFromChild(child);
-                state.xTranslation = width - state.xTranslation - child.getWidth();
+                state.setXTranslation(width - state.getXTranslation() - child.getWidth());
             }
         }
     }
@@ -364,7 +410,7 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
             }
 
             vs.initFrom(child);
-            vs.alpha = 1.0f;
+            vs.setAlpha(1.0f);
             vs.hidden = false;
         }
     }
@@ -396,7 +442,7 @@ public class StatusIconContainer extends AlphaOptimizedLinearLayout {
                 parentWidth = ((View) view.getParent()).getWidth();
             }
 
-            float currentDistanceToEnd = parentWidth - xTranslation;
+            float currentDistanceToEnd = parentWidth - getXTranslation();
 
             if (!(view instanceof StatusIconDisplayable)) {
                 return;

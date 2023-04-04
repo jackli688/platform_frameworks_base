@@ -23,7 +23,9 @@ import java.util.TimeZone;
 
 /**
  * Plugin used to replace main clock in keyguard.
+ * @deprecated Migrating to ClockProviderPlugin
  */
+@Deprecated
 @ProvidesInterface(action = ClockPlugin.ACTION, version = ClockPlugin.VERSION)
 public interface ClockPlugin extends Plugin {
 
@@ -125,6 +127,13 @@ public interface ClockPlugin extends Plugin {
      * Implement this method instead of registering a broadcast listener for TIME_ZONE_CHANGED.
      */
     default void onTimeZoneChanged(TimeZone timeZone) {}
+
+    /**
+     * Notifies that the time format has changed.
+     *
+     * @param timeFormat "12" for 12-hour format, "24" for 24-hour format
+     */
+    default void onTimeFormatChanged(String timeFormat) {}
 
     /**
      * Indicates whether the keyguard status area (date) should be shown below

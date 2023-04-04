@@ -16,20 +16,28 @@
 
 package com.android.server.display;
 
+import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_CAN_SHOW_WITH_INSECURE_KEYGUARD;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL;
+import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH;
+import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED;
 import static android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED;
 
+import static com.android.server.display.DisplayDeviceInfo.FLAG_ALWAYS_UNLOCKED;
+import static com.android.server.display.DisplayDeviceInfo.FLAG_OWN_DISPLAY_GROUP;
+import static com.android.server.display.DisplayDeviceInfo.FLAG_TOUCH_FEEDBACK_DISABLED;
 import static com.android.server.display.DisplayDeviceInfo.FLAG_TRUSTED;
 
+import android.annotation.Nullable;
 import android.content.Context;
+import android.graphics.Point;
 import android.hardware.display.IVirtualDisplayCallback;
 import android.hardware.display.VirtualDisplayConfig;
 import android.media.projection.IMediaProjection;
@@ -103,15 +111,20 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
         } else {
             uniqueId = UNIQUE_ID_PREFIX + ownerPackageName + ":" + uniqueId;
         }
+        MediaProjectionCallback mediaProjectionCallback =  null;
+        if (projection != null) {
+            mediaProjectionCallback = new MediaProjectionCallback(appToken);
+        }
         VirtualDisplayDevice device = new VirtualDisplayDevice(displayToken, appToken,
-                ownerUid, ownerPackageName, surface, flags, new Callback(callback, mHandler),
+                ownerUid, ownerPackageName, surface, flags,
+                new Callback(callback, mHandler), projection, mediaProjectionCallback,
                 uniqueId, uniqueIndex, virtualDisplayConfig);
 
         mVirtualDisplayDevices.put(appToken, device);
 
         try {
             if (projection != null) {
-                projection.registerCallback(new MediaProjectionCallback(appToken));
+                projection.registerCallback(mediaProjectionCallback);
             }
             appToken.linkToDeath(device, 0);
         } catch (RemoteException ex) {
@@ -196,7 +209,7 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
     }
 
     private void handleMediaProjectionStoppedLocked(IBinder appToken) {
-        VirtualDisplayDevice device = mVirtualDisplayDevices.remove(appToken);
+        VirtualDisplayDevice device = mVirtualDisplayDevices.get(appToken);
         if (device != null) {
             Slog.i(TAG, "Virtual display device released because media projection stopped: "
                     + device.mName);
@@ -216,6 +229,8 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
         final String mName;
         private final int mFlags;
         private final Callback mCallback;
+        @Nullable private final IMediaProjection mProjection;
+        @Nullable private final IMediaProjectionCallback mMediaProjectionCallback;
 
         private int mWidth;
         private int mHeight;
@@ -229,12 +244,14 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
         private Display.Mode mMode;
         private boolean mIsDisplayOn;
         private int mDisplayIdToMirror;
+        private boolean mIsWindowManagerMirroring;
 
         public VirtualDisplayDevice(IBinder displayToken, IBinder appToken,
                 int ownerUid, String ownerPackageName, Surface surface, int flags,
-                Callback callback, String uniqueId, int uniqueIndex,
+                Callback callback, IMediaProjection projection,
+                IMediaProjectionCallback mediaProjectionCallback, String uniqueId, int uniqueIndex,
                 VirtualDisplayConfig virtualDisplayConfig) {
-            super(VirtualDisplayAdapter.this, displayToken, uniqueId);
+            super(VirtualDisplayAdapter.this, displayToken, uniqueId, getContext());
             mAppToken = appToken;
             mOwnerUid = ownerUid;
             mOwnerPackageName = ownerPackageName;
@@ -246,11 +263,14 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
             mSurface = surface;
             mFlags = flags;
             mCallback = callback;
+            mProjection = projection;
+            mMediaProjectionCallback = mediaProjectionCallback;
             mDisplayState = Display.STATE_UNKNOWN;
             mPendingChanges |= PENDING_SURFACE_CHANGE;
             mUniqueIndex = uniqueIndex;
             mIsDisplayOn = surface != null;
             mDisplayIdToMirror = virtualDisplayConfig.getDisplayIdToMirror();
+            mIsWindowManagerMirroring = virtualDisplayConfig.isWindowManagerMirroring();
         }
 
         @Override
@@ -260,6 +280,13 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
                 Slog.i(TAG, "Virtual display device released because application token died: "
                     + mOwnerPackageName);
                 destroyLocked(false);
+                if (mProjection != null && mMediaProjectionCallback != null) {
+                    try {
+                        mProjection.unregisterCallback(mMediaProjectionCallback);
+                    } catch (RemoteException e) {
+                        Slog.w(TAG, "Failed to unregister callback in binderDied", e);
+                    }
+                }
                 sendDisplayDeviceEventLocked(this, DISPLAY_DEVICE_EVENT_REMOVED);
             }
         }
@@ -270,6 +297,13 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
                 mSurface = null;
             }
             SurfaceControl.destroyDisplay(getDisplayTokenLocked());
+            if (mProjection != null && mMediaProjectionCallback != null) {
+                try {
+                    mProjection.unregisterCallback(mMediaProjectionCallback);
+                } catch (RemoteException e) {
+                    Slog.w(TAG, "Failed to unregister callback in destroy", e);
+                }
+            }
             if (binderAlive) {
                 mCallback.dispatchDisplayStopped();
             }
@@ -278,6 +312,28 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
         @Override
         public int getDisplayIdToMirrorLocked() {
             return mDisplayIdToMirror;
+        }
+
+        @Override
+        public boolean isWindowManagerMirroringLocked() {
+            return mIsWindowManagerMirroring;
+        }
+
+        @Override
+        public void setWindowManagerMirroringLocked(boolean mirroring) {
+            if (mIsWindowManagerMirroring != mirroring) {
+                mIsWindowManagerMirroring = mirroring;
+                sendDisplayDeviceEventLocked(this, DISPLAY_DEVICE_EVENT_CHANGED);
+                sendTraversalRequestLocked();
+            }
+        }
+
+        @Override
+        public Point getDisplaySurfaceDefaultSizeLocked() {
+            if (mSurface == null) {
+                return null;
+            }
+            return mSurface.getDefaultSize();
         }
 
         @VisibleForTesting
@@ -291,7 +347,8 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
         }
 
         @Override
-        public Runnable requestDisplayStateLocked(int state, float brightnessState) {
+        public Runnable requestDisplayStateLocked(int state, float brightnessState,
+                float sdrBrightnessState) {
             if (state != mDisplayState) {
                 mDisplayState = state;
                 if (state == Display.STATE_OFF) {
@@ -359,6 +416,7 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
             pw.println("mDisplayState=" + Display.stateToString(mDisplayState));
             pw.println("mStopped=" + mStopped);
             pw.println("mDisplayIdToMirror=" + mDisplayIdToMirror);
+            pw.println("mWindowManagerMirroring=" + mIsWindowManagerMirroring);
         }
 
 
@@ -386,6 +444,10 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
                     mInfo.flags &= ~DisplayDeviceInfo.FLAG_NEVER_BLANK;
                 } else {
                     mInfo.flags |= DisplayDeviceInfo.FLAG_OWN_CONTENT_ONLY;
+
+                    if ((mFlags & VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP) != 0) {
+                        mInfo.flags |= FLAG_OWN_DISPLAY_GROUP;
+                    }
                 }
 
                 if ((mFlags & VIRTUAL_DISPLAY_FLAG_SECURE) != 0) {
@@ -417,6 +479,13 @@ public class VirtualDisplayAdapter extends DisplayAdapter {
                 }
                 if ((mFlags & VIRTUAL_DISPLAY_FLAG_TRUSTED) != 0) {
                     mInfo.flags |= FLAG_TRUSTED;
+                }
+                if ((mFlags & VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED) != 0
+                        && (mInfo.flags & DisplayDeviceInfo.FLAG_OWN_DISPLAY_GROUP) != 0) {
+                    mInfo.flags |= FLAG_ALWAYS_UNLOCKED;
+                }
+                if ((mFlags & VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED) != 0) {
+                    mInfo.flags |= FLAG_TOUCH_FEEDBACK_DISABLED;
                 }
 
                 mInfo.type = Display.TYPE_VIRTUAL;

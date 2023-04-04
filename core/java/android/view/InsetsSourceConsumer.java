@@ -19,6 +19,13 @@ package android.view;
 import static android.view.InsetsController.ANIMATION_TYPE_NONE;
 import static android.view.InsetsController.AnimationType;
 import static android.view.InsetsController.DEBUG;
+import static android.view.InsetsSourceConsumerProto.HAS_WINDOW_FOCUS;
+import static android.view.InsetsSourceConsumerProto.INTERNAL_INSETS_TYPE;
+import static android.view.InsetsSourceConsumerProto.IS_REQUESTED_VISIBLE;
+import static android.view.InsetsSourceConsumerProto.PENDING_FRAME;
+import static android.view.InsetsSourceConsumerProto.PENDING_VISIBLE_FRAME;
+import static android.view.InsetsSourceConsumerProto.SOURCE_CONTROL;
+import static android.view.InsetsState.ITYPE_IME;
 import static android.view.InsetsState.getDefaultVisibility;
 import static android.view.InsetsState.toPublicType;
 
@@ -27,15 +34,19 @@ import static com.android.internal.annotations.VisibleForTesting.Visibility.PACK
 import android.annotation.IntDef;
 import android.annotation.Nullable;
 import android.graphics.Rect;
+import android.util.ArraySet;
 import android.util.Log;
+import android.util.proto.ProtoOutputStream;
 import android.view.InsetsState.InternalInsetsType;
 import android.view.SurfaceControl.Transaction;
 import android.view.WindowInsets.Type.InsetsType;
 
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.inputmethod.ImeTracing;
 
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
+import java.util.Objects;
 import java.util.function.Supplier;
 
 /**
@@ -72,16 +83,21 @@ public class InsetsSourceConsumer {
     private final Supplier<Transaction> mTransactionSupplier;
     private @Nullable InsetsSourceControl mSourceControl;
     private boolean mHasWindowFocus;
+
+    /**
+     * Whether the view has focus returned by {@link #onWindowFocusGained(boolean)}.
+     */
+    private boolean mHasViewFocusWhenWindowFocusGain;
     private Rect mPendingFrame;
     private Rect mPendingVisibleFrame;
 
     /**
-     * Indicates if we have the pending animation. When we have the control, we need to play the
-     * animation if the requested visibility is different from the current state. But if we haven't
-     * had a leash yet, we will set this flag, and play the animation once we get the leash.
+     * @param type The {@link InternalInsetsType} of the consumed insets.
+     * @param state The current {@link InsetsState} of the consumed insets.
+     * @param transactionSupplier The source of new {@link Transaction} instances. The supplier
+     *         must provide *new* instances, which will be explicitly closed by this class.
+     * @param controller The {@link InsetsController} to use for insets interaction.
      */
-    private boolean mIsAnimationPending;
-
     public InsetsSourceConsumer(@InternalInsetsType int type, InsetsState state,
             Supplier<Transaction> transactionSupplier, InsetsController controller) {
         mType = type;
@@ -98,13 +114,21 @@ public class InsetsSourceConsumer {
      *                  animation should be run after setting the control.
      * @param hideTypes An integer array with a single entry that determines which types a hide
      *                  animation should be run after setting the control.
+     * @return Whether the control has changed from the server
      */
-    public void setControl(@Nullable InsetsSourceControl control,
+    public boolean setControl(@Nullable InsetsSourceControl control,
             @InsetsType int[] showTypes, @InsetsType int[] hideTypes) {
-        if (mSourceControl == control) {
-            return;
+        if (mType == ITYPE_IME) {
+            ImeTracing.getInstance().triggerClientDump("InsetsSourceConsumer#setControl",
+                    mController.getHost().getInputMethodManager(), null /* icProto */);
         }
-        SurfaceControl oldLeash = mSourceControl != null ? mSourceControl.getLeash() : null;
+        if (Objects.equals(mSourceControl, control)) {
+            if (mSourceControl != null && mSourceControl != control) {
+                mSourceControl.release(SurfaceControl::release);
+                mSourceControl = control;
+            }
+            return false;
+        }
 
         final InsetsSourceControl lastControl = mSourceControl;
         mSourceControl = control;
@@ -113,34 +137,37 @@ public class InsetsSourceConsumer {
                     InsetsState.typeToString(control.getType()),
                     mController.getHost().getRootViewTitle()));
         }
-        // We are loosing control
         if (mSourceControl == null) {
+            // We are loosing control
             mController.notifyControlRevoked(this);
 
-            // Restore server visibility.
-            mState.getSource(getType()).setVisible(
-                    mController.getLastDispatchedState().getSource(getType()).isVisible());
+            // Check if we need to restore server visibility.
+            final InsetsSource source = mState.getSource(mType);
+            final boolean serverVisibility =
+                    mController.getLastDispatchedState().getSourceOrDefaultVisibility(mType);
+            if (source.isVisible() != serverVisibility) {
+                source.setVisible(serverVisibility);
+                mController.notifyVisibilityChanged();
+            }
+
+            // For updateCompatSysUiVisibility
             applyLocalVisibilityOverride();
         } else {
-            // We are gaining control, and need to run an animation since previous state
-            // didn't match
             final boolean requestedVisible = isRequestedVisibleAwaitingControl();
-            final boolean needAnimation = requestedVisible != mState.getSource(mType).isVisible();
-            if (control.getLeash() != null && (needAnimation || mIsAnimationPending)) {
-                if (DEBUG) Log.d(TAG, String.format("Gaining control in %s, requestedVisible: %b",
+            final SurfaceControl oldLeash = lastControl != null ? lastControl.getLeash() : null;
+            final SurfaceControl newLeash = control.getLeash();
+            if (newLeash != null && (oldLeash == null || !newLeash.isSameSurface(oldLeash))
+                    && requestedVisible != control.isInitiallyVisible()) {
+                // We are gaining leash, and need to run an animation since previous state
+                // didn't match.
+                if (DEBUG) Log.d(TAG, String.format("Gaining leash in %s, requestedVisible: %b",
                         mController.getHost().getRootViewTitle(), requestedVisible));
                 if (requestedVisible) {
                     showTypes[0] |= toPublicType(getType());
                 } else {
                     hideTypes[0] |= toPublicType(getType());
                 }
-                mIsAnimationPending = false;
             } else {
-                if (needAnimation) {
-                    // We need animation but we haven't had a leash yet. Set this flag that when we
-                    // get the leash we can play the deferred animation.
-                    mIsAnimationPending = true;
-                }
                 // We are gaining control, but don't need to run an animation.
                 // However make sure that the leash visibility is still up to date.
                 if (applyLocalVisibilityOverride()) {
@@ -149,11 +176,12 @@ public class InsetsSourceConsumer {
 
                 // If we have a new leash, make sure visibility is up-to-date, even though we
                 // didn't want to run an animation above.
-                SurfaceControl newLeash = mSourceControl.getLeash();
-                if (oldLeash == null || newLeash == null || !oldLeash.isSameSurface(newLeash)) {
-                    applyHiddenToControl();
+                if (mController.getAnimationType(control.getType()) == ANIMATION_TYPE_NONE) {
+                    applyRequestedVisibilityToControl();
                 }
-                if (!requestedVisible && !mIsAnimationPending) {
+
+                // Remove the surface that owned by last control when it lost.
+                if (!requestedVisible && lastControl == null) {
                     removeSurface();
                 }
             }
@@ -161,6 +189,7 @@ public class InsetsSourceConsumer {
         if (lastControl != null) {
             lastControl.release(SurfaceControl::release);
         }
+        return true;
     }
 
     @VisibleForTesting
@@ -203,8 +232,9 @@ public class InsetsSourceConsumer {
     /**
      * Called when current window gains focus
      */
-    public void onWindowFocusGained() {
+    public void onWindowFocusGained(boolean hasViewFocus) {
         mHasWindowFocus = true;
+        mHasViewFocusWhenWindowFocusGain = hasViewFocus;
     }
 
     /**
@@ -214,8 +244,8 @@ public class InsetsSourceConsumer {
         mHasWindowFocus = false;
     }
 
-    boolean hasWindowFocus() {
-        return mHasWindowFocus;
+    boolean hasViewFocusWhenWindowFocusGain() {
+        return mHasViewFocusWhenWindowFocusGain;
     }
 
     boolean applyLocalVisibilityOverride() {
@@ -223,11 +253,13 @@ public class InsetsSourceConsumer {
         final boolean isVisible = source != null ? source.isVisible() : getDefaultVisibility(mType);
         final boolean hasControl = mSourceControl != null;
 
-        // We still need to let the legacy app know the visibility change even if we don't have the
-        // control. If we don't have the source, we don't change the requested visibility for making
-        // the callback behavior compatible.
-        mController.updateCompatSysUiVisibility(
-                mType, (hasControl || source == null) ? mRequestedVisible : isVisible, hasControl);
+        if (mType == ITYPE_IME) {
+            ImeTracing.getInstance().triggerClientDump(
+                    "InsetsSourceConsumer#applyLocalVisibilityOverride",
+                    mController.getHost().getInputMethodManager(), null /* icProto */);
+        }
+
+        updateCompatSysUiVisibility(hasControl, source, isVisible);
 
         // If we don't have control, we are not able to change the visibility.
         if (!hasControl) {
@@ -243,6 +275,36 @@ public class InsetsSourceConsumer {
                 mController.getHost().getRootViewTitle(), mRequestedVisible));
         mState.getSource(mType).setVisible(mRequestedVisible);
         return true;
+    }
+
+    private void updateCompatSysUiVisibility(boolean hasControl, InsetsSource source,
+            boolean visible) {
+        final @InsetsType int publicType = InsetsState.toPublicType(mType);
+        if (publicType != WindowInsets.Type.statusBars()
+                && publicType != WindowInsets.Type.navigationBars()) {
+            // System UI visibility only controls status bars and navigation bars.
+            return;
+        }
+        final boolean compatVisible;
+        if (hasControl) {
+            compatVisible = mRequestedVisible;
+        } else if (source != null && !source.getFrame().isEmpty()) {
+            compatVisible = visible;
+        } else {
+            final ArraySet<Integer> types = InsetsState.toInternalType(publicType);
+            for (int i = types.size() - 1; i >= 0; i--) {
+                final InsetsSource s = mState.peekSource(types.valueAt(i));
+                if (s != null && !s.getFrame().isEmpty()) {
+                    // The compat system UI visibility would be updated by another consumer which
+                    // handles the same public insets type.
+                    return;
+                }
+            }
+            // No one provides the public type. Use the requested visibility for making the callback
+            // behavior compatible.
+            compatVisible = mRequestedVisible;
+        }
+        mController.updateCompatSysUiVisibility(mType, compatVisible, hasControl);
     }
 
     @VisibleForTesting
@@ -330,7 +392,7 @@ public class InsetsSourceConsumer {
     protected void setRequestedVisible(boolean requestedVisible) {
         if (mRequestedVisible != requestedVisible) {
             mRequestedVisible = requestedVisible;
-            mIsAnimationPending = false;
+            mController.onRequestedVisibilityChanged(this);
             if (DEBUG) Log.d(TAG, "setRequestedVisible: " + requestedVisible);
         }
         if (applyLocalVisibilityOverride()) {
@@ -338,19 +400,39 @@ public class InsetsSourceConsumer {
         }
     }
 
-    private void applyHiddenToControl() {
+    private void applyRequestedVisibilityToControl() {
         if (mSourceControl == null || mSourceControl.getLeash() == null) {
             return;
         }
 
-        final Transaction t = mTransactionSupplier.get();
-        if (DEBUG) Log.d(TAG, "applyHiddenToControl: " + mRequestedVisible);
-        if (mRequestedVisible) {
-            t.show(mSourceControl.getLeash());
-        } else {
-            t.hide(mSourceControl.getLeash());
+        try (Transaction t = mTransactionSupplier.get()) {
+            if (DEBUG) Log.d(TAG, "applyRequestedVisibilityToControl: " + mRequestedVisible);
+            if (mRequestedVisible) {
+                t.show(mSourceControl.getLeash());
+            } else {
+                t.hide(mSourceControl.getLeash());
+            }
+            // Ensure the alpha value is aligned with the actual requested visibility.
+            t.setAlpha(mSourceControl.getLeash(), mRequestedVisible ? 1 : 0);
+            t.apply();
         }
-        t.apply();
         onPerceptible(mRequestedVisible);
+    }
+
+    void dumpDebug(ProtoOutputStream proto, long fieldId) {
+        final long token = proto.start(fieldId);
+        proto.write(INTERNAL_INSETS_TYPE, InsetsState.typeToString(mType));
+        proto.write(HAS_WINDOW_FOCUS, mHasWindowFocus);
+        proto.write(IS_REQUESTED_VISIBLE, mRequestedVisible);
+        if (mSourceControl != null) {
+            mSourceControl.dumpDebug(proto, SOURCE_CONTROL);
+        }
+        if (mPendingFrame != null) {
+            mPendingFrame.dumpDebug(proto, PENDING_FRAME);
+        }
+        if (mPendingVisibleFrame != null) {
+            mPendingVisibleFrame.dumpDebug(proto, PENDING_VISIBLE_FRAME);
+        }
+        proto.end(token);
     }
 }

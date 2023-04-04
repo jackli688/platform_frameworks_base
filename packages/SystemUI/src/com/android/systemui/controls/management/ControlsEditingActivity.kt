@@ -16,40 +16,49 @@
 
 package com.android.systemui.controls.management
 
+import android.app.ActivityOptions
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewStub
 import android.widget.Button
 import android.widget.TextView
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
+import androidx.activity.ComponentActivity
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.RecyclerView
 import com.android.systemui.R
-import com.android.systemui.broadcast.BroadcastDispatcher
 import com.android.systemui.controls.CustomIconCache
 import com.android.systemui.controls.controller.ControlsControllerImpl
 import com.android.systemui.controls.controller.StructureInfo
-import com.android.systemui.globalactions.GlobalActionsComponent
-import com.android.systemui.settings.CurrentUserTracker
-import com.android.systemui.util.LifecycleActivity
+import com.android.systemui.controls.ui.ControlsActivity
+import com.android.systemui.controls.ui.ControlsUiController
+import com.android.systemui.dagger.qualifiers.Main
+import com.android.systemui.settings.UserTracker
+import java.util.concurrent.Executor
 import javax.inject.Inject
 
 /**
  * Activity for rearranging and removing controls for a given structure
  */
-class ControlsEditingActivity @Inject constructor(
+open class ControlsEditingActivity @Inject constructor(
+    @Main private val mainExecutor: Executor,
     private val controller: ControlsControllerImpl,
-    broadcastDispatcher: BroadcastDispatcher,
-    private val globalActionsComponent: GlobalActionsComponent,
-    private val customIconCache: CustomIconCache
-) : LifecycleActivity() {
+    private val userTracker: UserTracker,
+    private val customIconCache: CustomIconCache,
+    private val uiController: ControlsUiController
+) : ComponentActivity() {
 
     companion object {
+        private const val DEBUG = false
         private const val TAG = "ControlsEditingActivity"
-        private const val EXTRA_STRUCTURE = ControlsFavoritingActivity.EXTRA_STRUCTURE
+        const val EXTRA_STRUCTURE = ControlsFavoritingActivity.EXTRA_STRUCTURE
         private val SUBTITLE_ID = R.string.controls_favorite_rearrange
         private val EMPTY_TEXT_ID = R.string.controls_favorite_removed
     }
@@ -60,15 +69,22 @@ class ControlsEditingActivity @Inject constructor(
     private lateinit var subtitle: TextView
     private lateinit var saveButton: View
 
-    private val currentUserTracker = object : CurrentUserTracker(broadcastDispatcher) {
+    private val userTrackerCallback: UserTracker.Callback = object : UserTracker.Callback {
         private val startingUser = controller.currentUserId
 
-        override fun onUserSwitched(newUserId: Int) {
-            if (newUserId != startingUser) {
-                stopTracking()
+        override fun onUserChanged(newUser: Int, userContext: Context) {
+            if (newUser != startingUser) {
+                userTracker.removeCallback(this)
                 finish()
             }
         }
+    }
+
+    private val mOnBackInvokedCallback = OnBackInvokedCallback {
+        if (DEBUG) {
+            Log.d(TAG, "Predictive Back dispatcher called mOnBackInvokedCallback")
+        }
+        onBackPressed()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,16 +107,26 @@ class ControlsEditingActivity @Inject constructor(
         super.onStart()
         setUpList()
 
-        currentUserTracker.startTracking()
+        userTracker.addCallback(userTrackerCallback, mainExecutor)
+
+        if (DEBUG) {
+            Log.d(TAG, "Registered onBackInvokedCallback")
+        }
+        onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT, mOnBackInvokedCallback)
     }
 
     override fun onStop() {
         super.onStop()
-        currentUserTracker.stopTracking()
+        userTracker.removeCallback(userTrackerCallback)
+
+        if (DEBUG) {
+            Log.d(TAG, "Unregistered onBackInvokedCallback")
+        }
+        onBackInvokedDispatcher.unregisterOnBackInvokedCallback(mOnBackInvokedCallback)
     }
 
     override fun onBackPressed() {
-        globalActionsComponent.handleShowGlobalActionsMenu()
         animateExitAndFinish()
     }
 
@@ -139,14 +165,17 @@ class ControlsEditingActivity @Inject constructor(
     }
 
     private fun bindButtons() {
-        val rootView = requireViewById<ViewGroup>(R.id.controls_management_root)
         saveButton = requireViewById<Button>(R.id.done).apply {
             isEnabled = false
             setText(R.string.save)
             setOnClickListener {
                 saveFavorites()
+                startActivity(
+                    Intent(applicationContext, ControlsActivity::class.java),
+                    ActivityOptions
+                        .makeSceneTransitionAnimation(this@ControlsEditingActivity).toBundle()
+                )
                 animateExitAndFinish()
-                globalActionsComponent.handleShowGlobalActionsMenu()
             }
         }
     }
@@ -191,10 +220,11 @@ class ControlsEditingActivity @Inject constructor(
         val margin = resources
                 .getDimensionPixelSize(R.dimen.controls_card_margin)
         val itemDecorator = MarginItemDecorator(margin, margin)
+        val spanCount = ControlAdapter.findMaxColumns(resources)
 
         recyclerView.apply {
             this.adapter = adapter
-            layoutManager = object : GridLayoutManager(recyclerView.context, 2) {
+            layoutManager = object : GridLayoutManager(recyclerView.context, spanCount) {
 
                 // This will remove from the announcement the row corresponding to the divider,
                 // as it's not something that should be announced.
@@ -206,7 +236,12 @@ class ControlsEditingActivity @Inject constructor(
                     return if (initial > 0) initial - 1 else initial
                 }
             }.apply {
-                spanSizeLookup = adapter.spanSizeLookup
+                spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
+                    override fun getSpanSize(position: Int): Int {
+                        return if (adapter?.getItemViewType(position)
+                                != ControlAdapter.TYPE_CONTROL) spanCount else 1
+                    }
+                }
             }
             addItemDecoration(itemDecorator)
         }
@@ -216,7 +251,7 @@ class ControlsEditingActivity @Inject constructor(
     }
 
     override fun onDestroy() {
-        currentUserTracker.stopTracking()
+        userTracker.removeCallback(userTrackerCallback)
         super.onDestroy()
     }
 }
